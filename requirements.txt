@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+tqdm
+phonenumbers
+openpyxl
+pandas
