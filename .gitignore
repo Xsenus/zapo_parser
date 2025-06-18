@@ -28,3 +28,6 @@ venv/
 
 # Jupyter
 *.ipynb_checkpoints
+
+# Logs directory
+zapo_logs/
