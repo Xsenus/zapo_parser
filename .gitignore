@@ -1,10 +1,30 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Logs and data
 *.log
-*.xlsx
 *.json
+*.xlsx
 .env
+
+# VS Code / PyCharm
 .vscode/
 .idea/
+
+# Results
+stage*.json
+stage*.xlsx
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Virtual environments
+venv/
+.venv/
+
+# Jupyter
+*.ipynb_checkpoints
