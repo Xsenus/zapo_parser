@@ -63,13 +63,16 @@ def get_models_and_versions(brand_name, brand_url):
             version = version_name.text.strip() if version_name else ""
             dates = re.sub(r"\s+", " ", date_range.text.strip()) if date_range else ""
             image = urljoin("https:", img_tag['src']) if img_tag and img_tag.get('src') else ""
+            version_url = urljoin(BASE_URL, tile['href']) if tile and tile.has_attr('href') else ""
 
             result.append({
                 "brand": brand_name,
+                "brand_url": brand_url,
                 "model": model_name,
                 "version": version,
                 "dates": dates,
-                "image": image
+                "image": image,
+                "version_url": version_url
             })
     return result
 
