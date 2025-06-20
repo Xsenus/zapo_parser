@@ -15,6 +15,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+CHROME_DRIVER_PATH = ChromeDriverManager().install()
 
 # ---------- Константы ----------
 INPUT_FILE = "stage10_models_detailed.json"
@@ -23,15 +24,22 @@ OUTPUT_FILE = "stage11_modifications_detailed.json"
 PROXY_FILE = "proxies_cleaned.txt"
 TMP_DIR = "stage11_temp_results"
 LOG_DIR = "zapo_logs"
-THREADS_REQUESTS = 250
-THREADS_SELENIUM = 15
+THREADS_REQUESTS = 100
+THREADS_SELENIUM = 10
 PAGE_TIMEOUT = 30
+RETRIES_REQUESTS = 10 
+MIRRORS = ["https://zapo.ru", "https://vindoc.ru", "https://autona88.ru"]
+
+def with_mirror(url, mirror):
+    return re.sub(r"https://[^/]+", mirror, url)
+
+def is_rate_limited(html_text):
+    return 'Превышен лимит запросов в день' in html_text
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 }
 
-# ---------- Подготовка ----------
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(TMP_DIR, exist_ok=True)
 log_file_path = os.path.join(LOG_DIR, f"stage11_log_{datetime.now():%Y%m%d_%H%M%S}.txt")
@@ -42,6 +50,19 @@ good_proxies = []
 used_proxies = set()
 requests_phase_results = []
 failed_items = []
+
+def extract_expected_modifications(soup):
+    divs = soup.find_all("div")
+    for div in divs:
+        if "Модификаций:" in div.text:
+            match = re.search(r"Модификаций:\s*(\d+)", div.text)
+            if match:
+                return int(match.group(1))
+    return None
+
+def get_pages_total_actual(soup):
+    pages = soup.select("a.pageNumber.selectFilterPage")
+    return max([int(a.text.strip()) for a in pages if a.text.strip().isdigit()], default=1)
 
 def log(msg):
     print(msg)
@@ -59,12 +80,18 @@ def load_proxies():
         return [line.strip() for line in f if line.strip()]
 
 def extract_rows(soup):
+    table = soup.select_one("table#dataTable")
+    if not table:
+        return []
+
     result = []
-    rows = soup.select("table tr")
+    rows = table.select("tbody > tr")
+
     for row in rows:
         cols = row.find_all("td")
         if len(cols) < 6:
             continue
+
         link_tag = cols[0].find("a")
         result.append({
             "name": link_tag.get_text(strip=True) if link_tag else "",
@@ -74,7 +101,16 @@ def extract_rows(soup):
             "country": cols[4].get_text(strip=True),
             "description": cols[5].get_text(strip=True),
         })
+
+    log(f"[EXTRACT_ROWS] Найдено строк: {len(result)}")
     return result
+
+def get_pages_total(soup):
+    pages = soup.select("ul.fr-pagination li a.selectFilterPage")
+    try:
+        return max([int(p.text.strip()) for p in pages if p.text.strip().isdigit()], default=1)
+    except:
+        return 1
 
 def setup_driver(proxy):
     options = Options()
@@ -84,7 +120,7 @@ def setup_driver(proxy):
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument(f'--proxy-server=socks5://{proxy}')
     log(f"[PROXY] Используется: {proxy}")
-    service = Service(ChromeDriverManager().install())
+    service = Service(CHROME_DRIVER_PATH)
     return webdriver.Chrome(service=service, options=options)
 
 def try_requests_first(url, proxy):
@@ -96,24 +132,128 @@ def try_requests_first(url, proxy):
         response = requests.get(url, headers=HEADERS, proxies=proxies, timeout=10)
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, "html.parser")
-            if soup.select("table tr"):
-                log(f"[REQUESTS] Успешно загружено через proxy {proxy}")
-                return extract_rows(soup), proxy
+            rows = extract_rows(soup)
+            pages_total = get_pages_total(soup)
+            table_found = bool(soup.select("table tr"))
+            log(f"[REQUESTS] Успешно загружено через proxy {proxy}, rows={len(rows)}")
+            return rows, proxy, table_found, pages_total
     except Exception as e:
         log(f"[REQUESTS ERROR] {proxy} — {e}")
-    return [], None
+    return [], None, False, 0
 
-def parse_with_selenium(url, proxy):
+def save_temp_file(item, rows, all_pages_loaded, pages_loaded_count, pages_total, table_found, modifications_expected=None):
+    enriched = {k: v for k, v in item.items() if k != "proxy"}
+    enriched.update({
+        "modification_table": rows,
+        "all_pages_loaded": all_pages_loaded,
+        "pages_loaded": pages_loaded_count,
+        "pages_total": pages_total,
+        "table_found": table_found,
+        "modifications_received": len(rows),
+        "modifications_expected": modifications_expected
+    })
+    filename = os.path.join(TMP_DIR, f"{safe_filename(item['brand'])}_{safe_filename(item['model'])}.json")
+    with save_lock:
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(enriched, f, ensure_ascii=False, indent=2)
+    log(f"[SAVE] Временный файл сохранён: {filename}")
+
+def is_access_denied(html_text):
+    return "Access denied to" in html_text or "<title>Access Denied</title>" in html_text
+
+def prepare_requests_phase(item):
+    filename = os.path.join(TMP_DIR, f"{safe_filename(item['brand'])}_{safe_filename(item['model'])}.json")
+    if os.path.exists(filename):
+        with open(filename, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+        if existing.get("all_pages_loaded", False):
+            log(f"[SKIP] {item['brand']} | {item['model']} — уже полностью обработан.")
+            return
+
+    proxy_list = load_proxies()
+    used_proxies_per_item = set()
+    tried_mirrors = set()
+
+    for mirror in MIRRORS:
+        url = with_mirror(item["modification_url"], mirror)
+        mirror_limited = False
+
+        for attempt in range(RETRIES_REQUESTS):
+            for proxy in proxy_list:
+                if proxy in used_proxies_per_item:
+                    continue
+                used_proxies_per_item.add(proxy)
+                used_proxies.add(proxy)
+
+                try:
+                    proxies = {
+                        "http": f"socks5h://{proxy}",
+                        "https": f"socks5h://{proxy}"
+                    }
+                    
+                    response = requests.get(url, headers=HEADERS, proxies=proxies, timeout=10)
+
+                    if is_access_denied(response.text):
+                        log(f"[ACCESS DENIED] {mirror} | {item['brand']} {item['model']} — доступ запрещён, пробуем другое зеркало.")
+                        continue
+
+                    if is_rate_limited(response.text):
+                        log(f"[LIMIT] {mirror} | {item['brand']} {item['model']} — превышен лимит, пробуем другое зеркало.")
+                        mirror_limited = True
+                        break  # выход из прокси-цикла, но не всей функции
+
+                    if response.status_code == 200:
+                        soup = BeautifulSoup(response.text, "html.parser")
+                        expected_modifications = extract_expected_modifications(soup)
+                        rows = extract_rows(soup)
+                        
+                        if len(rows) == 0:
+                            log(f"[EMPTY TABLE] {mirror} | {item['brand']} {item['model']} — таблица пуста, пробуем другое зеркало.")
+                            mirror_limited = True
+                            break
+                                                
+                        pages_total = get_pages_total(soup)
+                        table_found = bool(soup.select("table tr"))
+                        log(f"[REQUESTS] OK: {mirror} через {proxy}, rows={len(rows)}")
+
+                        item["proxy"] = proxy
+                        if proxy not in good_proxies:
+                            good_proxies.append(proxy)
+
+                        # Приводим URL к zapo.ru для унификации
+                        item["modification_url"] = with_mirror(item["modification_url"], "https://zapo.ru")
+
+                        save_temp_file(item, rows, all_pages_loaded=False,
+                                       pages_loaded_count=1, pages_total=pages_total,
+                                       table_found=table_found, modifications_expected=expected_modifications)
+                        requests_phase_results.append(item)
+                        return
+                except Exception as e:
+                    log(f"[REQUESTS ERROR] {mirror} | {proxy} — {e}")
+
+            if mirror_limited:
+                break  # переходим к следующему зеркалу
+
+        log(f"[MIRROR FAIL] {mirror} не дал результат для {item['brand']} | {item['model']}")
+        tried_mirrors.add(mirror)
+
+    failed_items.append(item)
+    log(f"[FAILED REQUESTS] {item['brand']} | {item['model']} — все зеркала и прокси не сработали")
+
+def parse_with_selenium(url, proxy, start_page=2):
     all_rows = []
     visited_pages = set()
+    driver = None
     try:
         driver = setup_driver(proxy)
         driver.set_page_load_timeout(PAGE_TIMEOUT)
         driver.get(url)
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "dataTable")))
         soup = BeautifulSoup(driver.page_source, "html.parser")
-        all_rows.extend(extract_rows(soup))
+        expected_modifications = extract_expected_modifications(soup)
+        pages_total = get_pages_total_actual(soup)
         visited_pages.add("1")
+        all_rows.extend(extract_rows(soup))
 
         while True:
             current_li = soup.select_one("ul.fr-pagination li.active span")
@@ -121,7 +261,7 @@ def parse_with_selenium(url, proxy):
                 visited_pages.add(current_li.text.strip())
 
             next_a = next((a for a in soup.select("ul.fr-pagination li a.selectFilterPage")
-                           if a.text.strip() not in visited_pages), None)
+                           if a.text.strip() not in visited_pages and int(a.text.strip()) >= start_page), None)
 
             if next_a:
                 page_text = next_a.text.strip()
@@ -138,87 +278,95 @@ def parse_with_selenium(url, proxy):
             else:
                 break
 
-        driver.quit()
-        return all_rows, True, len(visited_pages)
+        return all_rows, True, len(visited_pages), pages_total, expected_modifications
     except Exception as e:
         log(f"[SELENIUM ERROR] Прокси {proxy} — {e}")
-        try:
-            driver.quit()
-        except:
-            pass
-    return [], False, 0
-
-def save_temp_file(item, rows, all_pages_loaded, pages_loaded_count):
-    enriched = {k: v for k, v in item.items() if k != "proxy"}  # исключаем 'proxy'
-    enriched["modification_table"] = rows
-    enriched["all_pages_loaded"] = all_pages_loaded
-    enriched["pages_loaded"] = pages_loaded_count
-    filename = os.path.join(TMP_DIR, f"{safe_filename(item['brand'])}_{safe_filename(item['model'])}.json")
-    with save_lock:
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(enriched, f, ensure_ascii=False, indent=2)
-
-def prepare_requests_phase(item):
-    filename = os.path.join(TMP_DIR, f"{safe_filename(item['brand'])}_{safe_filename(item['model'])}.json")
-    if os.path.exists(filename):
-        with open(filename, "r", encoding="utf-8") as f:
-            existing = json.load(f)
-        if existing.get("all_pages_loaded", False):
-            log(f"[SKIP] {item['brand']} | {item['model']} — уже обработан.")
-            return
-
-    proxy_list = load_proxies()
-    for proxy in proxy_list:
-        if proxy in used_proxies:
-            continue
-        used_proxies.add(proxy)
-        rows, ok_proxy = try_requests_first(item["modification_url"], proxy)
-        if rows:
-            item["proxy"] = ok_proxy
-            requests_phase_results.append(item)
-            if ok_proxy and ok_proxy not in good_proxies:
-                good_proxies.append(ok_proxy)
-            save_temp_file(item, rows, all_pages_loaded=False, pages_loaded_count=1)
-            return
-
-    # ⛔ Если не удалось ни с одним прокси
-    failed_items.append(item)
-    log(f"[FAILED REQUESTS] {item['brand']} | {item['model']} — не удалось получить первую страницу через requests")
+        return [], False, 0, 0, None
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except:
+                pass
 
 def selenium_phase(item):
-    url = item["modification_url"]
-    proxy_list = []
-    if "proxy" in item:
-        proxy_list.append(item["proxy"])
+    original_url = item["modification_url"]
+    pages_loaded = item.get("pages_loaded", 1)
+    pages_total = item.get("pages_total", 1)
+    existing_rows = item.get("modification_table", [])
+    table_found = item.get("table_found", True)
 
-    extra_proxies = [p for p in good_proxies + load_proxies() if p not in proxy_list]
-    proxy_list.extend(extra_proxies)
+    expected_modifications = None
 
-    if not proxy_list:
-        log(f"[SELENIUM SKIP] {item['brand']} | {item['model']} — нет доступных прокси")
-        failed_items.append(item)
-        return
-    
-    for proxy in proxy_list:
-        if proxy in used_proxies:
-            continue
-        used_proxies.add(proxy)
-        log(f"[SELENIUM] {item['brand']} | {item['model']} — пробуем через {proxy}")
-        rows, success, page_count = parse_with_selenium(url, proxy)
-        if rows:
-            save_temp_file(item, rows, all_pages_loaded=success, pages_loaded_count=page_count)
-            log(f"[FINAL] {item['brand']} | {item['model']} — {len(rows)} строк | pages={page_count} | success={success}")
-            return
-        else:
-            log(f"[RETRY SELENIUM] {item['brand']} | {item['model']} — прокси {proxy} не дал результат")
+    proxy_list_all = [item.get("proxy")] if "proxy" in item else []
+    proxy_list_all += [p for p in good_proxies + load_proxies() if p not in proxy_list_all]
+
+    for mirror in MIRRORS:
+        url = with_mirror(original_url, mirror)
+        mirror_limited = False
+
+        for proxy in proxy_list_all:
+            if proxy in used_proxies:
+                continue
+            used_proxies.add(proxy)
+
+            log(f"[SELENIUM] {item['brand']} | {item['model']} — зеркало: {mirror}, прокси: {proxy}")
+            rows, success, page_count, real_pages_total, expected_modifications = parse_with_selenium(url, proxy, start_page=pages_loaded + 1)
+
+            if rows is not None and len(rows) == 0:
+                log(f"[EMPTY TABLE] {mirror} | {item['brand']} {item['model']} — Selenium получил 0 строк, переходим к другому зеркалу.")
+                mirror_limited = True
+                break
+
+            if rows:
+                total_rows = existing_rows + rows
+                modifications_received = len(total_rows)
+                all_loaded = (
+                    (page_count + pages_loaded) >= real_pages_total and
+                    (expected_modifications is None or modifications_received == expected_modifications)
+                )
+
+                # Унифицируем URL
+                item["modification_url"] = with_mirror(original_url, "https://zapo.ru")
+
+                save_temp_file(item, total_rows, all_pages_loaded=all_loaded,
+                               pages_loaded=page_count + pages_loaded,
+                               pages_total=real_pages_total,
+                               table_found=table_found,
+                               modifications_expected=expected_modifications)
+
+                log(f"[FINAL] {item['brand']} | {item['model']} — {modifications_received} строк | pages={page_count} | success={success}")
+                return
+
+            elif expected_modifications is None and page_count == 0:
+                # Проверим лимит
+                try:
+                    driver = setup_driver(proxy)
+                    driver.get(url)
+                    html = driver.page_source
+                    
+                    if is_access_denied(html):
+                        log(f"[ACCESS DENIED] {mirror} | {item['brand']} {item['model']} — Selenium получил страницу отказа.")
+                        continue
+                    
+                    driver.quit()
+                    if is_rate_limited(html):
+                        log(f"[LIMIT] {mirror} | {item['brand']} {item['model']} — лимит по зеркалу в Selenium.")
+                        mirror_limited = True
+                        break
+                except Exception as e:
+                    log(f"[Selenium Check Error] {proxy} — {e}")
+
+        if mirror_limited:
+            continue  # переходим к следующему зеркалу
 
     failed_items.append(item)
-    log(f"[FAILED] {item['brand']} | {item['model']} — не удалось обработать Selenium")
+    log(f"[FAILED SELENIUM] {item['brand']} | {item['model']} — все зеркала/прокси не сработали")
 
 def main():
     all_tasks = []
 
-    # Загружаем из основного входного файла
+    # Загрузка входных данных
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
     for brand in data:
@@ -232,7 +380,7 @@ def main():
                 "modification_url": model.get("modification_url")
             })
 
-    # Добавляем ранее неудавшиеся (если есть)
+    # Подгружаем ранее неудачные попытки
     if os.path.exists(FAILED_FILE):
         with open(FAILED_FILE, "r", encoding="utf-8") as f:
             failed_previous = json.load(f)
@@ -241,27 +389,27 @@ def main():
 
     log(f"🔍 Всего моделей для обработки: {len(all_tasks)}")
 
-    # 1️⃣ Первичная обработка через requests
+    # 🔹 Фаза 1 — requests
     with ThreadPoolExecutor(max_workers=THREADS_REQUESTS) as executor:
         list(tqdm(executor.map(prepare_requests_phase, all_tasks), total=len(all_tasks), desc="🌐 Requests-парсинг"))
 
-    # 2️⃣ Добавляем модели с all_pages_loaded = false из TMP_DIR
+    # 🔹 Фаза 2 — читаем TMP-файлы, обрабатываем не завершённые
+    requests_phase_results.clear()
     for fname in os.listdir(TMP_DIR):
         try:
             with open(os.path.join(TMP_DIR, fname), "r", encoding="utf-8") as f:
                 model_data = json.load(f)
-            if not model_data.get("all_pages_loaded", False):
+            if not model_data.get("all_pages_loaded", False) and model_data.get("table_found", True):
                 requests_phase_results.append(model_data)
         except Exception as e:
             log(f"[ERROR] Не удалось загрузить {fname}: {e}")
-
     log(f"🧠 Передано в Selenium-фазу: {len(requests_phase_results)} моделей")
 
-    # 3️⃣ Selenium дообработка
+    # 🔹 Фаза 3 — Selenium
     with ThreadPoolExecutor(max_workers=THREADS_SELENIUM) as executor:
         list(tqdm(executor.map(selenium_phase, requests_phase_results), total=len(requests_phase_results), desc="🧠 Selenium-парсинг"))
 
-    # 4️⃣ Финальный сбор результатов
+    # 🔹 Фаза 4 — сбор всех результатов
     final_data = []
     for fname in os.listdir(TMP_DIR):
         with open(os.path.join(TMP_DIR, fname), "r", encoding="utf-8") as f:
@@ -276,7 +424,6 @@ def main():
     if failed_items:
         with open(FAILED_FILE, "w", encoding="utf-8") as f:
             json.dump(failed_items, f, ensure_ascii=False, indent=2)
-        log(f"⚠️ Неудачных моделей: {len(failed_items)}. Сохранено в {FAILED_FILE}")
     else:
         if os.path.exists(FAILED_FILE):
             os.remove(FAILED_FILE)
