@@ -28,7 +28,15 @@ THREADS_REQUESTS = 100
 THREADS_SELENIUM = 10
 PAGE_TIMEOUT = 30
 RETRIES_REQUESTS = 10 
-MIRRORS = ["https://zapo.ru", "https://vindoc.ru", "https://autona88.ru"]
+MIRRORS = [
+    "https://part.avtomir.ru",
+    "https://zapo.ru",
+    "https://vindoc.ru",
+    "https://autona88.ru",
+    "https://b2b.autorus.ru",
+    "https://xxauto.pro",
+    "https://motexc.ru"
+    ]
 
 def with_mirror(url, mirror):
     return re.sub(r"https://[^/]+", mirror, url)
@@ -141,12 +149,12 @@ def try_requests_first(url, proxy):
         log(f"[REQUESTS ERROR] {proxy} — {e}")
     return [], None, False, 0
 
-def save_temp_file(item, rows, all_pages_loaded, pages_loaded_count, pages_total, table_found, modifications_expected=None):
+def save_temp_file(item, rows, all_pages_loaded, pages_loaded, pages_total, table_found, modifications_expected=None):
     enriched = {k: v for k, v in item.items() if k != "proxy"}
     enriched.update({
         "modification_table": rows,
         "all_pages_loaded": all_pages_loaded,
-        "pages_loaded": pages_loaded_count,
+        "pages_loaded": pages_loaded,
         "pages_total": pages_total,
         "table_found": table_found,
         "modifications_received": len(rows),
@@ -224,8 +232,8 @@ def prepare_requests_phase(item):
                         item["modification_url"] = with_mirror(item["modification_url"], "https://zapo.ru")
 
                         save_temp_file(item, rows, all_pages_loaded=False,
-                                       pages_loaded_count=1, pages_total=pages_total,
-                                       table_found=table_found, modifications_expected=expected_modifications)
+                            pages_loaded=1, pages_total=pages_total,
+                            table_found=table_found, modifications_expected=expected_modifications)
                         requests_phase_results.append(item)
                         return
                 except Exception as e:
@@ -313,6 +321,10 @@ def selenium_phase(item):
             log(f"[SELENIUM] {item['brand']} | {item['model']} — зеркало: {mirror}, прокси: {proxy}")
             rows, success, page_count, real_pages_total, expected_modifications = parse_with_selenium(url, proxy, start_page=pages_loaded + 1)
 
+            if not success:
+                log(f"[PROXY FAIL] Ошибка при подключении через {proxy}, пробуем следующий прокси.")
+                continue  # ❗ Пробуем другой прокси, не выходим
+
             if rows is not None and len(rows) == 0:
                 log(f"[EMPTY TABLE] {mirror} | {item['brand']} {item['model']} — Selenium получил 0 строк, переходим к другому зеркалу.")
                 mirror_limited = True
@@ -320,12 +332,14 @@ def selenium_phase(item):
 
             if rows:
                 total_rows = existing_rows + rows
+                # Удаляем дубликаты по URL
+                seen = set()
+                total_rows = [r for r in total_rows if (r['url'] not in seen and not seen.add(r['url']))]
                 modifications_received = len(total_rows)
                 all_loaded = (
-                    (page_count + pages_loaded) >= real_pages_total and
-                    (expected_modifications is None or modifications_received == expected_modifications)
+                    (page_count + pages_loaded) >= real_pages_total or
+                    (expected_modifications is not None and modifications_received >= expected_modifications)
                 )
-
                 # Унифицируем URL
                 item["modification_url"] = with_mirror(original_url, "https://zapo.ru")
 
@@ -334,7 +348,7 @@ def selenium_phase(item):
                                pages_total=real_pages_total,
                                table_found=table_found,
                                modifications_expected=expected_modifications)
-
+                log(f"[DEDUP] Удалено {len(existing_rows) + len(rows) - len(total_rows)} дублей.")
                 log(f"[FINAL] {item['brand']} | {item['model']} — {modifications_received} строк | pages={page_count} | success={success}")
                 return
 
@@ -390,8 +404,8 @@ def main():
     log(f"🔍 Всего моделей для обработки: {len(all_tasks)}")
 
     # 🔹 Фаза 1 — requests
-    with ThreadPoolExecutor(max_workers=THREADS_REQUESTS) as executor:
-        list(tqdm(executor.map(prepare_requests_phase, all_tasks), total=len(all_tasks), desc="🌐 Requests-парсинг"))
+    # with ThreadPoolExecutor(max_workers=THREADS_REQUESTS) as executor:
+    #     list(tqdm(executor.map(prepare_requests_phase, all_tasks), total=len(all_tasks), desc="🌐 Requests-парсинг"))
 
     # 🔹 Фаза 2 — читаем TMP-файлы, обрабатываем не завершённые
     requests_phase_results.clear()
