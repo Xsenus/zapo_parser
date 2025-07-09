@@ -5,6 +5,7 @@ import time
 import requests
 from datetime import datetime
 from threading import Lock
+from utils import load_proxies, get_proxy_dict, proxy_lock
 from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 from tqdm import tqdm
@@ -81,11 +82,6 @@ def log(msg):
 def safe_filename(name):
     return re.sub(r'[\\/:"*?<>|]+', "_", name)
 
-def load_proxies():
-    if not os.path.exists(PROXY_FILE):
-        return []
-    with open(PROXY_FILE, "r", encoding="utf-8") as f:
-        return [line.strip() for line in f if line.strip()]
 
 def extract_rows(soup):
     table = soup.select_one("table#dataTable")
@@ -133,10 +129,7 @@ def setup_driver(proxy):
 
 def try_requests_first(url, proxy):
     try:
-        proxies = {
-            "http": f"socks5h://{proxy}",
-            "https": f"socks5h://{proxy}"
-        }
+        proxies = get_proxy_dict(proxy)
         response = requests.get(url, headers=HEADERS, proxies=proxies, timeout=10)
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, "html.parser")
@@ -178,7 +171,7 @@ def prepare_requests_phase(item):
             log(f"[SKIP] {item['brand']} | {item['model']} — уже полностью обработан.")
             return
 
-    proxy_list = load_proxies()
+    proxy_list = load_proxies(PROXY_FILE)
     used_proxies_per_item = set()
     tried_mirrors = set()
 
@@ -194,10 +187,7 @@ def prepare_requests_phase(item):
                 used_proxies.add(proxy)
 
                 try:
-                    proxies = {
-                        "http": f"socks5h://{proxy}",
-                        "https": f"socks5h://{proxy}"
-                    }
+                    proxies = get_proxy_dict(proxy)
                     
                     response = requests.get(url, headers=HEADERS, proxies=proxies, timeout=10)
 
@@ -307,7 +297,7 @@ def selenium_phase(item):
     expected_modifications = None
 
     proxy_list_all = [item.get("proxy")] if "proxy" in item else []
-    proxy_list_all += [p for p in good_proxies + load_proxies() if p not in proxy_list_all]
+    proxy_list_all += [p for p in good_proxies + load_proxies(PROXY_FILE) if p not in proxy_list_all]
 
     for mirror in MIRRORS:
         url = with_mirror(original_url, mirror)
