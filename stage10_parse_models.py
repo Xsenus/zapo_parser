@@ -6,6 +6,7 @@ import json
 import random
 from datetime import datetime
 from threading import Lock
+from utils import load_proxies, get_proxy_dict, proxy_lock
 
 INPUT_FILE = "stage9_brands.json"
 OUTPUT_FILE = "stage10_models_detailed.json"
@@ -32,45 +33,35 @@ def log(message: str):
         with open(log_file_path, "a", encoding="utf-8") as f:
             f.write(message + "\n")
 
-def load_proxies():
-    if os.path.exists(PROXY_ALIVE_FILE):
-        with open(PROXY_ALIVE_FILE, "r", encoding="utf-8") as f:
-            proxies = [line.strip() for line in f if line.strip()]
-        if proxies:
-            log(f"[INFO] Используем {len(proxies)} живых прокси")
-            return proxies
-    if os.path.exists(PROXY_FILE):
-        with open(PROXY_FILE, "r", encoding="utf-8") as f:
-            proxies = [line.strip() for line in f if line.strip()]
-        log(f"[INFO] Используем {len(proxies)} прокси")
-        return proxies
-    return []
-
-proxies = load_proxies()
+proxies = load_proxies(PROXY_FILE, PROXY_ALIVE_FILE)
 working_proxies = []
 
 def fetch_html(url):
+    """Download a URL using available proxies with retries."""
     global proxies, working_proxies
     for attempt in range(1, RETRIES + 1):
-        local_proxies = proxies.copy()
-        random.shuffle(local_proxies)
+        with proxy_lock:
+            proxy_list = proxies.copy()
+        random.shuffle(proxy_list)
 
-        while local_proxies:
-            proxy = local_proxies.pop()
+        while proxy_list:
+            proxy = proxy_list.pop()
             try:
                 response = requests.get(
                     url, headers=HEADERS,
-                    proxies={"http": f"socks5h://{proxy}", "https": f"socks5h://{proxy}"},
+                    proxies=get_proxy_dict(proxy),
                     timeout=10
                 )
                 response.raise_for_status()
-                if proxy not in working_proxies:
-                    working_proxies.append(proxy)
+                with proxy_lock:
+                    if proxy not in working_proxies:
+                        working_proxies.append(proxy)
                 return response.text
             except Exception as e:
                 log(f"[PROXY ERROR] {proxy} — {e}")
-                if proxy in proxies:
-                    proxies.remove(proxy)
+                with proxy_lock:
+                    if proxy in proxies:
+                        proxies.remove(proxy)
 
         try:
             log(f"[ATTEMPT {attempt}] Пробуем без прокси...")

@@ -9,6 +9,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from threading import Lock
+from utils import load_proxies, get_proxy_dict, proxy_lock
 import hashlib
 
 INPUT_FILE = "stage5_carbase.json"
@@ -28,7 +29,6 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 log_file_path = os.path.join(LOG_DIR, f"carbase_versions_log_{datetime.now():%Y%m%d_%H%M%S}.txt")
 
 log_lock = Lock()
-proxy_lock = Lock()
 alive_proxies = set()
 used_proxies = []
 
@@ -38,23 +38,17 @@ def log(message: str):
         with open(log_file_path, "a", encoding="utf-8") as f:
             f.write(message + "\n")
 
-def load_proxies():
-    if not os.path.exists(PROXY_FILE):
-        return []
-    with open(PROXY_FILE, "r", encoding="utf-8") as f:
-        return [line.strip() for line in f if line.strip()]
-
-proxies = load_proxies()
-
-def get_proxy_dict(proxy):
-    proto = "socks5h" if proxy.endswith(":7788") else "socks5h"
-    return {"http": f"{proto}://{proxy}", "https": f"{proto}://{proxy}"}
+proxies = load_proxies(PROXY_FILE, PROXY_ALIVE_FILE)
 
 def fetch_html(url):
+    """Download a URL using available proxies with thread safety."""
     global proxies, alive_proxies
-    random.shuffle(proxies)
 
-    for proxy in proxies.copy():
+    with proxy_lock:
+        proxy_list = proxies.copy()
+    random.shuffle(proxy_list)
+
+    for proxy in proxy_list:
         proxy_dict = get_proxy_dict(proxy)
         try:
             response = requests.get(url, headers=HEADERS, timeout=10, proxies=proxy_dict)
