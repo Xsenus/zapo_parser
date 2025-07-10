@@ -8,6 +8,7 @@ from tqdm import tqdm
 import re
 import idna
 from urllib.parse import urlparse, urlunparse
+from utils import load_proxies, fetch_with_proxies
 
 INPUT_FILE = 'brands.json'
 OUTPUT_FILE = 'stage2_sites.json'
@@ -16,6 +17,11 @@ MAX_WORKERS = 10
 SAVE_EVERY = 5
 MAX_RETRIES = 25
 BASE_URL = 'https://zapo.ru'
+PROXY_FILE = 'proxies_cleaned.txt'
+PROXY_ALIVE_FILE = 'proxies_alive.txt'
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+proxies = load_proxies(PROXY_FILE, PROXY_ALIVE_FILE)
+working_proxies: list[str] = []
 
 
 def load_json_file(filename):
@@ -114,16 +120,19 @@ def fetch_with_retries(brand, retries=MAX_RETRIES) -> dict | None:
         "Referer": "https://zapo.ru/brandslist",
         "Connection": "keep-alive",
         "DNT": "1",
-        "Upgrade-Insecure-Requests": "1"
+        "Upgrade-Insecure-Requests": "1",
     }
 
     backoff = 2  # стартовая задержка
 
     for attempt in range(1, retries + 1):
         try:
-            response = requests.get(brand_url, headers=headers, timeout=10)
-            response.raise_for_status()
-            site = extract_company_site(response.text)
+            html, _ = fetch_with_proxies(
+                brand_url, proxies, working_proxies, headers=headers, retries=1
+            )
+            if not html:
+                raise Exception("empty response")
+            site = extract_company_site(html)
             return {
                 'name': name,
                 'brand_page': brand_url,

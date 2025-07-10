@@ -6,11 +6,16 @@ from tqdm import tqdm
 import os
 from datetime import datetime
 import re
+from utils import load_proxies, fetch_with_proxies, MIRRORS, with_mirror
 
 BASE_URL = "https://zapo.ru"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 }
+PROXY_FILE = "proxies_cleaned.txt"
+PROXY_ALIVE_FILE = "proxies_alive.txt"
+proxies = load_proxies(PROXY_FILE, PROXY_ALIVE_FILE)
+working_proxies: list[str] = []
 OUTPUT_FILE = "stage5_carbase.json"
 LOG_DIR = "zapo_logs"
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -24,24 +29,36 @@ def log(message: str):
 
 
 def get_brands():
-    url = f"{BASE_URL}/carbase"
-    response = requests.get(url, headers=HEADERS, timeout=10)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, 'html.parser')
+    for mirror in MIRRORS:
+        url = with_mirror(f"{BASE_URL}/carbase", mirror)
+        html, _ = fetch_with_proxies(
+            url, proxies, working_proxies, headers=HEADERS, retries=3, logger=log
+        )
+        if html:
+            soup = BeautifulSoup(html, 'html.parser')
+            break
+    else:
+        raise RuntimeError("Failed to load brands from all mirrors")
     brand_divs = soup.select("div.carbase3Brands__brand a")
 
     brands = []
     for a in brand_divs:
         name = a.text.strip()
         link = urljoin(BASE_URL, a['href'])
+        if link:
+            link = with_mirror(link, "https://zapo.ru")
         brands.append((name, link))
     return brands
 
 
 def get_models_and_versions(brand_name, brand_url):
-    response = requests.get(brand_url, headers=HEADERS, timeout=10)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, 'html.parser')
+    html, _ = fetch_with_proxies(
+        brand_url, proxies, working_proxies, headers=HEADERS, retries=3, logger=log
+    )
+    if not html:
+        log(f"[ERROR] {brand_name}: unable to load {brand_url}")
+        return []
+    soup = BeautifulSoup(html, 'html.parser')
 
     model_groups = {
         group['href'].replace("#group_", ""): group.get_text(strip=True)
@@ -64,6 +81,8 @@ def get_models_and_versions(brand_name, brand_url):
             dates = re.sub(r"\s+", " ", date_range.text.strip()) if date_range else ""
             image = urljoin("https:", img_tag['src']) if img_tag and img_tag.get('src') else ""
             version_url = urljoin(BASE_URL, tile['href']) if tile and tile.has_attr('href') else ""
+            if version_url:
+                version_url = with_mirror(version_url, "https://zapo.ru")
 
             result.append({
                 "brand": brand_name,

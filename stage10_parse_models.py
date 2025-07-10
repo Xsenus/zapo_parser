@@ -6,7 +6,7 @@ import json
 import random
 from datetime import datetime
 from threading import Lock
-from utils import load_proxies, get_proxy_dict, proxy_lock
+from utils import load_proxies, get_proxy_dict, proxy_lock, MIRRORS, with_mirror
 
 INPUT_FILE = "stage9_brands.json"
 OUTPUT_FILE = "stage10_models_detailed.json"
@@ -14,7 +14,7 @@ PROXY_FILE = "proxies_cleaned.txt"
 PROXY_ALIVE_FILE = "proxies_alive.txt"
 TMP_DIR = "stage10_temp_results"
 LOG_DIR = "zapo_logs"
-BASE_URL = "https://zapo.ru"
+BASE_URL = MIRRORS[1]  # default zapo.ru
 RETRIES = 15
 
 HEADERS = {
