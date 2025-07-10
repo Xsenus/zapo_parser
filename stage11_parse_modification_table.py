@@ -5,7 +5,7 @@ import time
 import requests
 from datetime import datetime
 from threading import Lock
-from utils import load_proxies, get_proxy_dict, proxy_lock
+from utils import load_proxies, get_proxy_dict, proxy_lock, MIRRORS, with_mirror
 from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 from tqdm import tqdm
@@ -28,19 +28,7 @@ LOG_DIR = "zapo_logs"
 THREADS_REQUESTS = 100
 THREADS_SELENIUM = 10
 PAGE_TIMEOUT = 30
-RETRIES_REQUESTS = 10 
-MIRRORS = [
-    "https://part.avtomir.ru",
-    "https://zapo.ru",
-    "https://vindoc.ru",
-    "https://autona88.ru",
-    "https://b2b.autorus.ru",
-    "https://xxauto.pro",
-    "https://motexc.ru"
-    ]
-
-def with_mirror(url, mirror):
-    return re.sub(r"https://[^/]+", mirror, url)
+RETRIES_REQUESTS = 10
 
 def is_rate_limited(html_text):
     return 'Превышен лимит запросов в день' in html_text

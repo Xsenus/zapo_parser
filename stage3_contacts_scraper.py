@@ -7,6 +7,7 @@ from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import phonenumbers
+from utils import load_proxies, fetch_with_proxies
 
 INPUT_FILE = 'stage2_sites.json'
 OUTPUT_FILE = 'stage3_contacts.json'
@@ -14,6 +15,11 @@ PROCESSED_LOG = 'stage3_contacts_processed.json'
 ERROR_LOG = 'stage3_errors.log'
 MAX_WORKERS = 25
 SAVE_EVERY = 5
+PROXY_FILE = 'proxies_cleaned.txt'
+PROXY_ALIVE_FILE = 'proxies_alive.txt'
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+proxies = load_proxies(PROXY_FILE, PROXY_ALIVE_FILE)
+working_proxies: list[str] = []
 
 
 def load_json(filename):
@@ -52,19 +58,10 @@ def extract_contacts(html: str) -> dict:
 
 
 def try_fetch(url):
-    try:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/114.0.0.0 Safari/537.36"
-            )
-        }
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
-        return response.text
-    except Exception:
-        return None
+    html, _ = fetch_with_proxies(
+        url, proxies, working_proxies, headers=HEADERS, retries=1
+    )
+    return html
 
 
 def find_contact_page(base_url, html):
