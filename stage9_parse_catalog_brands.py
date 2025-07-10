@@ -1,14 +1,12 @@
 # stage1_parse_catalog_brands.py
 
-import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 import os
 import json
-import random
 from datetime import datetime
 from threading import Lock
-from utils import load_proxies, get_proxy_dict, proxy_lock
+from utils import load_proxies, proxy_lock, fetch_with_proxies
 
 # === Константы ===
 URLS = {
@@ -49,43 +47,17 @@ proxies = load_proxies(PROXY_FILE, PROXY_ALIVE_FILE)
 working_proxies = []
 
 # === Получение HTML через SOCKS5 прокси ===
-def fetch_html(url):
-    """Download a URL using available proxies with retries."""
-    global proxies, working_proxies
-    for attempt in range(1, RETRIES + 1):
-        with proxy_lock:
-            proxy_list = proxies.copy()
-        random.shuffle(proxy_list)
-
-        while proxy_list:
-            proxy = proxy_list.pop()
-            try:
-                response = requests.get(
-                    url, headers=HEADERS,
-                    proxies=get_proxy_dict(proxy),
-                    timeout=10
-                )
-                response.raise_for_status()
-                with proxy_lock:
-                    if proxy not in working_proxies:
-                        working_proxies.append(proxy)
-                return response.text
-            except Exception as e:
-                log(f"[PROXY ERROR] {proxy} — {e}")
-                with proxy_lock:
-                    if proxy in proxies:
-                        proxies.remove(proxy)
-
-        try:
-            log(f"[ATTEMPT {attempt}] Пробуем без прокси...")
-            response = requests.get(url, headers=HEADERS, timeout=10)
-            response.raise_for_status()
-            return response.text
-        except Exception as e:
-            log(f"[ERROR] Попытка {attempt} без прокси не удалась: {e}")
-
-    log(f"[FAILED] Не удалось загрузить: {url} после {RETRIES} попыток")
-    return None
+def fetch_html(url: str) -> str | None:
+    """Load *url* using :func:`utils.fetch_with_proxies`."""
+    html, _ = fetch_with_proxies(
+        url,
+        proxies,
+        working_proxies,
+        headers=HEADERS,
+        retries=RETRIES,
+        logger=log,
+    )
+    return html
 
 # === Парсинг одной категории (foreign/native/moto) ===
 def parse_catalog(url):
