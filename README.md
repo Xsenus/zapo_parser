@@ -15,6 +15,8 @@
 - `stage9_parse_catalog_brands.py` — парсинг брендов по категориям (CARS_FOREIGN, CARS_NATIVE, MOTORCYCLE)  
 - `stage10_parse_models.py` — парсинг моделей по брендам  
 - `stage11_parse_modification_table.py` — постраничный парсинг таблицы модификаций
+- `stage12_export_modifications_to_excel.py` — экспорт модификаций в Excel
+- `stage13_oils_sitemaps.py` — генерация sitemap для каталога масел
 
 ## ⚙️ Установка
 
@@ -40,7 +42,9 @@ python stage8_export_parts_to_excel.py    # Детали
 ### Автокаталог и детали
 
 - `stage5_carbase.json` — автокаталог с zapo.ru  
-- `stage6_versions_detailed.json`, `stage7_parts_detailed.json`, `stage11_modifications_detailed.json` — JSON с модификациями и деталями  
+- `stage6_versions_detailed.json`, `stage7_parts_detailed.json`, `stage11_modifications_detailed.json` — JSON с модификациями и деталями
+- `stage12_modifications_export.xlsx` — итоговая таблица модификаций
+- `sitemaps_output/sitemap_catalog_index.xml` — sitemap каталога масел
 
 ## 📌 Параметры экспорта
 
