@@ -64,6 +64,8 @@ def parse_parts(modification_url):
     parts = []
 
     for row in rows:
+        group_id = row.get("data-goodsgroup", "").lstrip("#")
+
         img_tag = row.select_one("td img")
         image_url = img_tag['src'] if img_tag else ""
 
@@ -79,6 +81,7 @@ def parse_parts(modification_url):
         parts.append({
             "name": name,
             "group": group_name,
+            "group_id": group_id,
             "image_url": image_url,
             "search_url": search_url
         })
