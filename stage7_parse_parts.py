@@ -1,14 +1,12 @@
-import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 import json
 import os
-import random
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from threading import Lock
-from utils import load_proxies, get_proxy_dict, proxy_lock
+from utils import load_proxies, proxy_lock, fetch_with_proxies
 
 # === Настройки ===
 INPUT_FILE = "stage6_versions_detailed.json"
@@ -43,37 +41,17 @@ proxies = load_proxies(PROXY_FILE, PROXY_ALIVE_FILE)
 working_proxies = []
 
 # === Получение HTML с прокси ===
-def fetch_html(url):
-    """Download a URL using available proxies with thread safety."""
-    global proxies, working_proxies
-    with proxy_lock:
-        proxy_list = proxies.copy()
-    random.shuffle(proxy_list)
-
-    while proxy_list:
-        proxy = proxy_list.pop()
-        proxy_dict = get_proxy_dict(proxy)
-        try:
-            response = requests.get(url, headers=HEADERS, timeout=10, proxies=proxy_dict)
-            response.raise_for_status()
-            with proxy_lock:
-                if proxy not in working_proxies:
-                    working_proxies.append(proxy)
-            return response.text
-        except Exception as e:
-            log(f"[PROXY ERROR] {proxy} — {e}")
-            with proxy_lock:
-                if proxy in proxies:
-                    proxies.remove(proxy)
-
-    try:
-        log("[INFO] Переход к соединению без прокси")
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        response.raise_for_status()
-        return response.text
-    except Exception as e:
-        log(f"[ERROR] Ошибка без прокси при загрузке {url}: {str(e)}")
-        return None
+def fetch_html(url: str) -> str | None:
+    """Load *url* using :func:`utils.fetch_with_proxies`."""
+    html, _ = fetch_with_proxies(
+        url,
+        proxies,
+        working_proxies,
+        headers=HEADERS,
+        retries=1,
+        logger=log,
+    )
+    return html
 
 # === Парсинг деталей на странице ===
 def parse_parts(modification_url):

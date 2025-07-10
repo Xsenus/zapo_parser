@@ -1,15 +1,13 @@
-import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 import json
 import os
 import re
-import random
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 from threading import Lock
-from utils import load_proxies, get_proxy_dict, proxy_lock
+from utils import load_proxies, proxy_lock, fetch_with_proxies
 import hashlib
 
 INPUT_FILE = "stage5_carbase.json"
@@ -40,39 +38,23 @@ def log(message: str):
 
 proxies = load_proxies(PROXY_FILE, PROXY_ALIVE_FILE)
 
-def fetch_html(url):
-    """Download a URL using available proxies with thread safety."""
-    global proxies, alive_proxies
-
-    with proxy_lock:
-        proxy_list = proxies.copy()
-    random.shuffle(proxy_list)
-
-    for proxy in proxy_list:
-        proxy_dict = get_proxy_dict(proxy)
-        try:
-            response = requests.get(url, headers=HEADERS, timeout=10, proxies=proxy_dict)
-            response.raise_for_status()
-            with proxy_lock:
-                if proxy not in alive_proxies:
-                    alive_proxies.add(proxy)
-                    with open(PROXY_ALIVE_FILE, "a", encoding="utf-8") as f:
-                        f.write(proxy + "\n")
-            return response.text, proxy
-        except Exception as e:
-            log(f"[PROXY ERROR] {proxy} — {e}")
-            with proxy_lock:
-                if proxy in proxies:
-                    proxies.remove(proxy)
-
-    try:
-        log("[INFO] Используется соединение без прокси")
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        response.raise_for_status()
-        return response.text, None
-    except Exception as e:
-        log(f"[ERROR] Ошибка при загрузке {url}: {str(e)}")
-        return None, None
+def fetch_html(url: str) -> tuple[str | None, str | None]:
+    """Load *url* using :func:`utils.fetch_with_proxies` and track good proxies."""
+    html, proxy_used = fetch_with_proxies(
+        url,
+        proxies,
+        used_proxies,
+        headers=HEADERS,
+        retries=3,
+        logger=log,
+    )
+    if proxy_used:
+        with proxy_lock:
+            if proxy_used not in alive_proxies:
+                alive_proxies.add(proxy_used)
+                with open(PROXY_ALIVE_FILE, "a", encoding="utf-8") as f:
+                    f.write(proxy_used + "\n")
+    return html, proxy_used
 
 def parse_version_details(version_url, exclude_proxy=None):
     tried_proxies = set()
