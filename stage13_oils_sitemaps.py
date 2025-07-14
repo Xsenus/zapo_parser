@@ -1,196 +1,183 @@
 import os
 import re
+import json
 import gzip
+import xml.etree.ElementTree as ET
+from urllib.parse import quote
 from itertools import product
 from collections import defaultdict
-from urllib.parse import quote
 from datetime import datetime
-import xml.etree.ElementTree as ET
-
-import requests
+from typing import List, Dict
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utils import load_proxies, fetch_with_proxies
 
 # ---------- Константы ----------
-INPUT_HTML = "oils_catalog.txt"
-OUTPUT_DIR = "sitemaps_output"
+GROUPS_FILE = "groups.json"
+TEMP_DIR = "stage13_temp_results"
+OUTPUT_DIR = "stage13_temp_results/sitemaps_output"
 PROXY_FILE = "proxies_cleaned.txt"
 PROXY_ALIVE_FILE = "proxies_alive.txt"
 BASE_URL = "https://zapo.ru"
-TARGET_URL = "https://zapo.ru/oils_catalog"
 MAX_URLS = 50000
 MAX_XML_SIZE = 8 * 1024 * 1024
 REQUEST_TIMEOUT = 15
 RETRIES = 10
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+FILTER_LIMIT = 5
+THREADS = 25
 
+os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ---------- Загрузка прокси ----------
+# ---------- Прокси ----------
 proxies = load_proxies(PROXY_FILE, PROXY_ALIVE_FILE, logger=print)
-working_proxies: list[str] = []
+working_proxies: List[str] = []
 
+def reload_proxies():
+    return load_proxies(PROXY_FILE, PROXY_ALIVE_FILE, check_alive=True, logger=print)
 
-def reload_proxies() -> list[str]:
-    """Перезагрузка прокси с проверкой живости."""
-    return load_proxies(
-        PROXY_FILE,
-        PROXY_ALIVE_FILE,
-        logger=print,
-        check_alive=True,
-    )
+# ---------- Загрузка HTML ----------
+def download_and_save_html(group_id: str) -> str:
+    url = f"{BASE_URL}/{group_id}_catalog"
+    html_path = os.path.join(TEMP_DIR, f"{group_id}.html")
+    if os.path.exists(html_path):
+        with open(html_path, "r", encoding="utf-8") as f:
+            html = f.read()
+            if "<form" in html:
+                return html
+            os.remove(html_path)
 
-
-def fetch_catalog_page() -> str:
-    """Загрузить HTML-каталог с использованием прокси и перезагрузки."""
     html, _ = fetch_with_proxies(
-        TARGET_URL,
-        proxies,
-        working_proxies,
-        headers=HEADERS,
-        retries=RETRIES,
+        url, proxies, working_proxies,
+        headers=HEADERS, retries=RETRIES,
         timeout=REQUEST_TIMEOUT,
         logger=print,
         reload_proxies=reload_proxies,
     )
-    if not html or '<form' not in html:
-        raise RuntimeError('❌ Не удалось загрузить каталог масел')
-    return html
 
+    if not html or "<form" not in html:
+        raise RuntimeError(f"Не удалось загрузить HTML для группы: {group_id}")
 
-def load_or_fetch_html() -> str:
-    """Загрузить HTML из файла или с сайта, если файл отсутствует или повреждён."""
-    if os.path.exists(INPUT_HTML):
-        with open(INPUT_HTML, 'r', encoding='utf-8') as f:
-            html = f.read()
-            if '<form' in html:
-                return html
-            print("[HTML] ⚠️ Повреждённый кэш, пробуем заново...")
-            os.remove(INPUT_HTML)
-
-    html = fetch_catalog_page()
-    with open(INPUT_HTML, 'w', encoding='utf-8') as f:
+    with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
     return html
 
-
-def parse_filters(html: str) -> dict[str, list[str]]:
-    """Распарсить доступные фильтры из формы каталога."""
-    soup = BeautifulSoup(html, 'lxml')
-    form = soup.find('form', id='catalog-form')
+# ---------- Парсинг фильтров ----------
+def parse_filters(html: str) -> Dict[str, List[str]]:
+    soup = BeautifulSoup(html, "lxml")
+    form = soup.find("form", id="catalog-form")
     if not form:
-        raise ValueError("<form id='catalog-form'> не найдена")
-
-    checkboxes = form.find_all('input', {'type': 'checkbox', 'name': True})
-    filters: defaultdict[str, list[str]] = defaultdict(list)
-
+        raise ValueError("Форма с id='catalog-form' не найдена")
+    checkboxes = form.find_all("input", {"type": "checkbox", "name": True})
+    filters = defaultdict(list)
     for cb in checkboxes:
-        name = cb.get('name')
-        value = cb.get('value')
-        if not name or not value or not name.startswith('property['):
-            continue
-        m = re.search(r'property\[(.+?)\]', name)
-        if m:
-            key = m.group(1)
-            if key in {'brands', 'viscosity', 'oil_type'}:
-                filters[key].append(value)
+        name, value = cb.get("name"), cb.get("value")
+        m = re.search(r"property\[(.+?)\]", name or "")
+        if m and value:
+            filters[m.group(1)].append(value)
     return filters
 
+# ---------- Выбор ключей ----------
+def select_filter_keys(all_keys: List[str], limit: int = FILTER_LIMIT) -> List[str]:
+    return all_keys[:limit] if limit and len(all_keys) > limit else all_keys
 
-def generate_links(filters: dict[str, list[str]]) -> list[str]:
-    """Сгенерировать все возможные комбинации ссылок по фильтрам."""
+# ---------- Генерация ссылок ----------
+def generate_links(filters: Dict[str, List[str]], keys: List[str], group_id: str) -> List[str]:
+    values = [filters.get(k, []) for k in keys]
     links = []
-    for brand, viscosity, oil_type in product(
-        filters.get('brands', []),
-        filters.get('viscosity', []),
-        filters.get('oil_type', []),
-    ):
-        url = (
-            f"{BASE_URL}/oils_catalog?goods_group=oils&action=search&viewMode=tile&resultMode=5&hidePriceIn=1"
-            f"&property[brands][]={quote(brand)}"
-            f"&property[viscosity][]={quote(viscosity)}"
-            f"&property[oil_type][]={quote(oil_type)}"
-            f"&property[liquid_volume][from]=&property[liquid_volume][to]="
-        )
+    for combo in product(*values):
+        url = f"{BASE_URL}/{group_id}_catalog?goods_group={group_id}&action=search&viewMode=tile&resultMode=5&hidePriceIn=1"
+        for k, v in zip(keys, combo):
+            url += f"&property[{k}][]={quote(v)}"
         links.append(url)
     return links
 
+# ---------- Сохранение sitemap-файлов ----------
+def save_sitemaps(urls: List[str], group_id: str) -> List[str]:
+    now = datetime.now().isoformat(timespec="seconds") + "+03:00"
+    files, chunk, size, index = [], [], 0, 1
 
-def save_sitemaps(urls: list[str]) -> list[str]:
-    """Разбить ссылки на части и сохранить в .xml.gz файлы."""
-    files: list[str] = []
-    chunk: list[str] = []
-    size_estimate = 0
-    index = 1
-    now = datetime.now().isoformat(timespec='seconds') + '+03:00'
-
-    def write_chunk(chunk_urls: list[str], chunk_index: int) -> str:
-        urlset = ET.Element('urlset', xmlns='http://www.sitemaps.org/schemas/sitemap/0.9')
-        for url in chunk_urls:
-            url_el = ET.SubElement(urlset, 'url')
-            ET.SubElement(url_el, 'loc').text = url
-            ET.SubElement(url_el, 'lastmod').text = now
-            ET.SubElement(url_el, 'changefreq').text = 'weekly'
-        xml_path = os.path.join(OUTPUT_DIR, f'sitemap_catalog_{chunk_index}.xml')
-        ET.ElementTree(urlset).write(xml_path, encoding='utf-8', xml_declaration=True)
-        with open(xml_path, 'rb') as f_in, gzip.open(xml_path + '.gz', 'wb') as f_out:
+    def write_chunk(part_urls: List[str], part_index: int) -> str:
+        urlset = ET.Element("urlset", xmlns="http://www.sitemaps.org/schemas/sitemap/0.9")
+        for u in part_urls:
+            url_el = ET.SubElement(urlset, "url")
+            ET.SubElement(url_el, "loc").text = u
+            ET.SubElement(url_el, "lastmod").text = now
+            ET.SubElement(url_el, "changefreq").text = "weekly"
+        path = os.path.join(OUTPUT_DIR, f"sitemap_{group_id}_{part_index}.xml")
+        ET.ElementTree(urlset).write(path, encoding="utf-8", xml_declaration=True)
+        gz_path = path + ".gz"
+        with open(path, "rb") as f_in, gzip.open(gz_path, "wb") as f_out:
             f_out.writelines(f_in)
-        os.remove(xml_path)
-        return xml_path + '.gz'
+        os.remove(path)
+        return gz_path
 
     for url in urls:
-        entry = f"<url><loc>{url}</loc><lastmod>{now}</lastmod><changefreq>weekly</changefreq></url>"
-        size_estimate += len(entry.encode('utf-8'))
+        size += len(url.encode()) + 100
         chunk.append(url)
-        if len(chunk) >= MAX_URLS or size_estimate >= MAX_XML_SIZE:
-            gz_file = write_chunk(chunk, index)
-            files.append(gz_file)
+        if len(chunk) >= MAX_URLS or size >= MAX_XML_SIZE:
+            files.append(write_chunk(chunk, index))
+            chunk, size = [], 0
             index += 1
-            chunk = []
-            size_estimate = 0
 
     if chunk:
-        gz_file = write_chunk(chunk, index)
-        files.append(gz_file)
+        files.append(write_chunk(chunk, index))
 
     return files
 
-
-def generate_index(gz_files: list[str]) -> None:
-    """Сгенерировать индексный файл sitemap_catalog_index.xml"""
-    index_root = ET.Element('sitemapindex', xmlns='http://www.sitemaps.org/schemas/sitemap/0.9')
-    now = datetime.now().isoformat(timespec='seconds') + '+03:00'
+# ---------- Индексный sitemap ----------
+def generate_index(gz_files: List[str]):
+    now = datetime.now().isoformat(timespec="seconds") + "+03:00"
+    root = ET.Element("sitemapindex", xmlns="http://www.sitemaps.org/schemas/sitemap/0.9")
     for f in gz_files:
-        sitemap = ET.SubElement(index_root, 'sitemap')
-        ET.SubElement(sitemap, 'loc').text = f"{BASE_URL}/{os.path.basename(f)}"
-        ET.SubElement(sitemap, 'lastmod').text = now
-
-    ET.ElementTree(index_root).write(
-        os.path.join(OUTPUT_DIR, 'sitemap_catalog_index.xml'),
-        encoding='utf-8',
-        xml_declaration=True,
+        sm = ET.SubElement(root, "sitemap")
+        ET.SubElement(sm, "loc").text = f"{BASE_URL}/{os.path.basename(f)}"
+        ET.SubElement(sm, "lastmod").text = now
+    ET.ElementTree(root).write(
+        os.path.join(OUTPUT_DIR, "sitemap_catalog_index.xml"),
+        encoding="utf-8",
+        xml_declaration=True
     )
 
+# ---------- Обработка одной группы ----------
+def process_group(group: Dict) -> List[str]:
+    group_id = group["id"]
 
-def main() -> None:
-    html = load_or_fetch_html()
-    filters = parse_filters(html)
-    print('🧪 Найденные фильтры:')
-    for key in ['brands', 'viscosity', 'oil_type']:
-        values = filters.get(key, [])
-        preview = ", ".join(values[:5]) + ('...' if len(values) > 5 else '')
-        print(f"  {key}: {len(values)} значений → {preview}")
+    # ✅ Пропускаем, если файл уже существует
+    expected_file = os.path.join(OUTPUT_DIR, f"sitemap_{group_id}_1.xml.gz")
+    if os.path.exists(expected_file):
+        print(f"⏭️ {group_id} уже обработан, пропуск...")
+        return []
 
-    urls = generate_links(filters)
-    print(f'✅ Сгенерировано ссылок: {len(urls)}')
+    try:
+        print(f"🔍 {group_id}")
+        html = download_and_save_html(group_id)
+        filters = parse_filters(html)
+        all_keys = list(filters.keys())
+        selected = select_filter_keys(all_keys)
+        urls = generate_links(filters, selected, group_id)
+        print(f"✅ {group_id}: {len(urls)} ссылок по фильтрам {selected}")
+        return save_sitemaps(urls, group_id)
+    except Exception as e:
+        print(f"❌ Ошибка в группе {group_id}: {e}")
+        return []
 
-    gz_files = save_sitemaps(urls)
-    generate_index(gz_files)
+# ---------- Главная функция ----------
+def main():
+    with open(GROUPS_FILE, "r", encoding="utf-8") as f:
+        groups = json.load(f)
 
-    print('✅ Готово! Sitemap файлы находятся в:', OUTPUT_DIR)
+    all_gz = []
+    with ThreadPoolExecutor(max_workers=THREADS) as executor:
+        futures = [executor.submit(process_group, g) for g in groups]
+        for future in as_completed(futures):
+            all_gz.extend(future.result())
 
+    generate_index(all_gz)
+    print("🏁 Sitemap генерация завершена.")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
