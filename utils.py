@@ -2,7 +2,7 @@ from threading import Lock
 import os
 import random
 import re
-from typing import Callable, Iterable, Tuple
+from typing import Callable, Tuple
 import requests
 from concurrent.futures import ThreadPoolExecutor
 
@@ -16,17 +16,17 @@ __all__ = [
     "with_mirror",
 ]
 
-# Shared lock for thread-safe proxy operations
+# 🔒 Глобальный лок для потокобезопасной работы с прокси
 proxy_lock = Lock()
 
-# URL template for downloading SOCKS5 proxies from best-proxies.ru
+# 🔗 Шаблон URL для загрузки SOCKS5 прокси с best-proxies.ru
 PROXY_API_URL = (
     "https://api.best-proxies.ru/proxylist.txt"
     "?key={key}&type=socks5&level=1&speed=1&limit=0"
 )
 
 def download_proxies(api_key: str) -> list[str]:
-    """Download a list of proxies using the provided *api_key*."""
+    """Загрузить список SOCKS5-прокси по API-ключу с best-proxies.ru."""
     try:
         response = requests.get(PROXY_API_URL.format(key=api_key), timeout=10)
         response.raise_for_status()
@@ -35,7 +35,7 @@ def download_proxies(api_key: str) -> list[str]:
         return []
 
 def check_proxy_alive(proxy: str, timeout: int = 5) -> bool:
-    """Проверка, работает ли SOCKS5-прокси через запрос к Google."""
+    """Проверить, работает ли прокси через запрос к Google."""
     test_url = "https://www.google.com"
     try:
         response = requests.get(
@@ -48,7 +48,7 @@ def check_proxy_alive(proxy: str, timeout: int = 5) -> bool:
         return False
 
 def filter_alive_proxies(proxies: list[str], threads: int = 50) -> list[str]:
-    """Вернуть список только живых прокси."""
+    """Отфильтровать только рабочие прокси (многопоточно)."""
     with ThreadPoolExecutor(max_workers=threads) as executor:
         results = list(executor.map(check_proxy_alive, proxies))
     return [proxy for proxy, ok in zip(proxies, results) if ok]
@@ -62,26 +62,29 @@ def load_proxies(
     check_alive: bool = False,
 ) -> list[str]:
     """
-    Загружаем прокси с приоритетом API. При check_alive=True —
-    отфильтровываются живые и сохраняются в alive_file.
+    Загрузка прокси с приоритетом API.
+    При check_alive=True — оставляются только рабочие и сохраняются в alive_file.
     """
     proxies: set[str] = set()
     api_key = api_key or os.getenv("PROXY_API_KEY")
 
+    # 🔁 Попробовать загрузку с API
     if api_key:
         api_proxies = download_proxies(api_key)
         if api_proxies:
             proxies.update(api_proxies)
+            # 📁 Объединить с локальными (если есть)
             if os.path.exists(proxy_file):
                 with open(proxy_file, "r", encoding="utf-8") as f:
                     proxies.update(line.strip() for line in f if line.strip())
 
             proxies = sorted(proxies)
 
+            # ✅ Проверить живость, если требуется
             if check_alive:
                 if logger:
                     logger(f"[PROXIES] 🔍 Проверка {len(proxies)} прокси...")
-                alive = filter_alive_proxies(list(proxies))
+                alive = filter_alive_proxies(proxies)
                 if logger:
                     logger(f"[PROXIES] ✅ Живых: {len(alive)}")
 
@@ -90,22 +93,23 @@ def load_proxies(
                         f.write("\n".join(alive))
                 return alive
 
+            # 💾 Сохранить объединённые прокси
             with open(proxy_file, "w", encoding="utf-8") as f:
                 f.write("\n".join(proxies))
             if logger:
-                logger(f"[PROXIES] Загружено с API ({len(api_proxies)} новых), всего {len(proxies)}")
+                logger(f"[PROXIES] Загружено с API ({len(api_proxies)} новых), всего: {len(proxies)}")
             return list(proxies)
 
-    # Fallback to alive file
+    # 📂 Попробовать alive-файл
     if alive_file and os.path.exists(alive_file):
         with open(alive_file, "r", encoding="utf-8") as f:
             proxies = {line.strip() for line in f if line.strip()}
         if proxies:
             if logger:
-                logger(f"[PROXIES] Загружено из alive-файла ({alive_file}): {len(proxies)}")
+                logger(f"[PROXIES] Загружено из alive-файла: {len(proxies)}")
             return list(proxies)
 
-    # Fallback to proxy file
+    # 📂 Попробовать основной файл
     if os.path.exists(proxy_file):
         with open(proxy_file, "r", encoding="utf-8") as f:
             proxies = {line.strip() for line in f if line.strip()}
@@ -122,19 +126,18 @@ def load_proxies(
                 return alive
 
             if logger:
-                logger(f"[PROXIES] Загружено из proxy-файла ({proxy_file}): {len(proxies)}")
+                logger(f"[PROXIES] Загружено из proxy-файла: {len(proxies)}")
             return list(proxies)
 
     if logger:
-        logger("[PROXIES] Прокси не найдены — ни API, ни локальные файлы")
+        logger("[PROXIES] ❌ Прокси не найдены — ни API, ни локальные файлы.")
     return []
 
 def get_proxy_dict(proxy: str) -> dict:
-    """Return a requests-compatible proxy dictionary for SOCKS5 proxies."""
+    """Вернуть словарь прокси для requests с SOCKS5."""
     return {"http": f"socks5h://{proxy}", "https": f"socks5h://{proxy}"}
 
-
-# Default list of mirrors for zapo-like sites
+# 🔁 Список зеркал для обхода ограничений
 MIRRORS = [
     "https://part.avtomir.ru",
     "https://zapo.ru",
@@ -145,11 +148,9 @@ MIRRORS = [
     "https://motexc.ru",
 ]
 
-
 def with_mirror(url: str, mirror: str) -> str:
-    """Replace the host in *url* with the provided *mirror*."""
+    """Заменить домен в URL на указанный mirror."""
     return re.sub(r"https://[^/]+", mirror, url)
-
 
 def fetch_with_proxies(
     url: str,
@@ -160,10 +161,14 @@ def fetch_with_proxies(
     retries: int = 3,
     timeout: int = 10,
     logger: Callable[[str], None] | None = None,
+    reload_proxies: Callable[[], list[str]] | None = None,
 ) -> Tuple[str | None, str | None]:
-    """Fetch *url* trying the given proxies and return ``(text, used_proxy)``."""
-
+    """
+    Загружает страницу с использованием списка прокси. При неудаче —
+    перезапрашивает прокси из reload_proxies и повторяет попытку.
+    """
     working = working or []
+
     for attempt in range(1, retries + 1):
         with proxy_lock:
             proxy_list = proxies.copy()
@@ -185,21 +190,39 @@ def fetch_with_proxies(
                 return response.text, proxy
             except Exception as e:
                 if logger:
-                    logger(f"[PROXY ERROR] {proxy} — {e}")
+                    logger(f"[ПРОКСИ ОШИБКА] {proxy} — {e}")
                 with proxy_lock:
                     if proxy in proxies:
                         proxies.remove(proxy)
 
+        # 🔁 Прокси закончились — пробуем перезагрузить
+        if reload_proxies and attempt < retries:
+            if logger:
+                logger("[ПРОКСИ] 🔁 Все прокси исчерпаны. Пробуем загрузить новые...")
+            with proxy_lock:
+                new_proxies = reload_proxies()
+                if new_proxies:
+                    if logger:
+                        logger(f"[ПРОКСИ] Получено новых прокси: {len(new_proxies)}")
+                    proxies.clear()
+                    proxies.extend(new_proxies)
+                    continue
+                else:
+                    if logger:
+                        logger("[ПРОКСИ] ❌ Не удалось получить новые прокси.")
+                    break
+
+        # 📡 Последняя попытка — без прокси
         try:
             if logger:
-                logger(f"[ATTEMPT {attempt}] Пробуем без прокси...")
+                logger(f"[ПОПЫТКА {attempt}] Пробуем загрузить без прокси...")
             response = requests.get(url, headers=headers, timeout=timeout)
             response.raise_for_status()
             return response.text, None
         except Exception as e:
             if logger:
-                logger(f"[ERROR] Попытка {attempt} без прокси не удалась: {e}")
+                logger(f"[ОШИБКА] Попытка {attempt} без прокси не удалась: {e}")
 
     if logger:
-        logger(f"[FAILED] Не удалось загрузить: {url}")
+        logger(f"[ОШИБКА] ❌ Все попытки загрузки неудачны: {url}")
     return None, None
