@@ -1,11 +1,10 @@
-"""Common utilities for Zapo parsers."""
-
 from threading import Lock
 import os
 import random
 import re
 from typing import Callable, Iterable, Tuple
 import requests
+from concurrent.futures import ThreadPoolExecutor
 
 __all__ = [
     "proxy_lock",
@@ -26,7 +25,6 @@ PROXY_API_URL = (
     "?key={key}&type=socks5&level=1&speed=1&limit=0"
 )
 
-
 def download_proxies(api_key: str) -> list[str]:
     """Download a list of proxies using the provided *api_key*."""
     try:
@@ -36,42 +34,100 @@ def download_proxies(api_key: str) -> list[str]:
     except Exception:
         return []
 
+def check_proxy_alive(proxy: str, timeout: int = 5) -> bool:
+    """Проверка, работает ли SOCKS5-прокси через запрос к Google."""
+    test_url = "https://www.google.com"
+    try:
+        response = requests.get(
+            test_url,
+            proxies=get_proxy_dict(proxy),
+            timeout=timeout
+        )
+        return response.ok
+    except Exception:
+        return False
+
+def filter_alive_proxies(proxies: list[str], threads: int = 50) -> list[str]:
+    """Вернуть список только живых прокси."""
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        results = list(executor.map(check_proxy_alive, proxies))
+    return [proxy for proxy, ok in zip(proxies, results) if ok]
 
 def load_proxies(
     proxy_file: str,
     alive_file: str | None = None,
     *,
     api_key: str | None = None,
+    logger: Callable[[str], None] | None = None,
+    check_alive: bool = False,
 ) -> list[str]:
-    """Load proxies from ``alive_file`` or ``proxy_file``.
-
-    If files are missing and ``api_key`` (or ``PROXY_API_KEY`` env var)
-    is provided, proxies will be downloaded from best-proxies.ru and saved to
-    ``proxy_file``.
     """
-
-    if alive_file and os.path.exists(alive_file):
-        with open(alive_file, "r", encoding="utf-8") as f:
-            proxies = [line.strip() for line in f if line.strip()]
-        if proxies:
-            return proxies
-
-    if os.path.exists(proxy_file):
-        with open(proxy_file, "r", encoding="utf-8") as f:
-            proxies = [line.strip() for line in f if line.strip()]
-        if proxies:
-            return proxies
-
+    Загружаем прокси с приоритетом API. При check_alive=True —
+    отфильтровываются живые и сохраняются в alive_file.
+    """
+    proxies: set[str] = set()
     api_key = api_key or os.getenv("PROXY_API_KEY")
+
     if api_key:
-        proxies = download_proxies(api_key)
-        if proxies:
+        api_proxies = download_proxies(api_key)
+        if api_proxies:
+            proxies.update(api_proxies)
+            if os.path.exists(proxy_file):
+                with open(proxy_file, "r", encoding="utf-8") as f:
+                    proxies.update(line.strip() for line in f if line.strip())
+
+            proxies = sorted(proxies)
+
+            if check_alive:
+                if logger:
+                    logger(f"[PROXIES] 🔍 Проверка {len(proxies)} прокси...")
+                alive = filter_alive_proxies(list(proxies))
+                if logger:
+                    logger(f"[PROXIES] ✅ Живых: {len(alive)}")
+
+                if alive_file:
+                    with open(alive_file, "w", encoding="utf-8") as f:
+                        f.write("\n".join(alive))
+                return alive
+
             with open(proxy_file, "w", encoding="utf-8") as f:
                 f.write("\n".join(proxies))
-            return proxies
+            if logger:
+                logger(f"[PROXIES] Загружено с API ({len(api_proxies)} новых), всего {len(proxies)}")
+            return list(proxies)
 
+    # Fallback to alive file
+    if alive_file and os.path.exists(alive_file):
+        with open(alive_file, "r", encoding="utf-8") as f:
+            proxies = {line.strip() for line in f if line.strip()}
+        if proxies:
+            if logger:
+                logger(f"[PROXIES] Загружено из alive-файла ({alive_file}): {len(proxies)}")
+            return list(proxies)
+
+    # Fallback to proxy file
+    if os.path.exists(proxy_file):
+        with open(proxy_file, "r", encoding="utf-8") as f:
+            proxies = {line.strip() for line in f if line.strip()}
+        if proxies:
+            if check_alive:
+                if logger:
+                    logger(f"[PROXIES] 🔍 Проверка {len(proxies)} прокси из proxy-файла...")
+                alive = filter_alive_proxies(list(proxies))
+                if logger:
+                    logger(f"[PROXIES] ✅ Живых: {len(alive)}")
+                if alive_file:
+                    with open(alive_file, "w", encoding="utf-8") as f:
+                        f.write("\n".join(alive))
+                return alive
+
+            if logger:
+                logger(f"[PROXIES] Загружено из proxy-файла ({proxy_file}): {len(proxies)}")
+            return list(proxies)
+
+    if logger:
+        logger("[PROXIES] Прокси не найдены — ни API, ни локальные файлы")
     return []
-
 
 def get_proxy_dict(proxy: str) -> dict:
     """Return a requests-compatible proxy dictionary for SOCKS5 proxies."""
