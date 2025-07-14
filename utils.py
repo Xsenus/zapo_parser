@@ -10,6 +10,7 @@ import requests
 __all__ = [
     "proxy_lock",
     "load_proxies",
+    "download_proxies",
     "get_proxy_dict",
     "fetch_with_proxies",
     "MIRRORS",
@@ -19,17 +20,56 @@ __all__ = [
 # Shared lock for thread-safe proxy operations
 proxy_lock = Lock()
 
+# URL template for downloading SOCKS5 proxies from best-proxies.ru
+PROXY_API_URL = (
+    "https://api.best-proxies.ru/proxylist.txt"
+    "?key={key}&type=socks5&level=1&speed=1&limit=0"
+)
 
-def load_proxies(proxy_file: str, alive_file: str | None = None) -> list[str]:
-    """Load a list of proxies, preferring the alive file if provided."""
+
+def download_proxies(api_key: str) -> list[str]:
+    """Download a list of proxies using the provided *api_key*."""
+    try:
+        response = requests.get(PROXY_API_URL.format(key=api_key), timeout=10)
+        response.raise_for_status()
+        return [line.strip() for line in response.text.splitlines() if line.strip()]
+    except Exception:
+        return []
+
+
+def load_proxies(
+    proxy_file: str,
+    alive_file: str | None = None,
+    *,
+    api_key: str | None = None,
+) -> list[str]:
+    """Load proxies from ``alive_file`` or ``proxy_file``.
+
+    If files are missing and ``api_key`` (or ``PROXY_API_KEY`` env var)
+    is provided, proxies will be downloaded from best-proxies.ru and saved to
+    ``proxy_file``.
+    """
+
     if alive_file and os.path.exists(alive_file):
         with open(alive_file, "r", encoding="utf-8") as f:
             proxies = [line.strip() for line in f if line.strip()]
         if proxies:
             return proxies
+
     if os.path.exists(proxy_file):
         with open(proxy_file, "r", encoding="utf-8") as f:
-            return [line.strip() for line in f if line.strip()]
+            proxies = [line.strip() for line in f if line.strip()]
+        if proxies:
+            return proxies
+
+    api_key = api_key or os.getenv("PROXY_API_KEY")
+    if api_key:
+        proxies = download_proxies(api_key)
+        if proxies:
+            with open(proxy_file, "w", encoding="utf-8") as f:
+                f.write("\n".join(proxies))
+            return proxies
+
     return []
 
 
