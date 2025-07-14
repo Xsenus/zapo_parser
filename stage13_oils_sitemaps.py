@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 
 from utils import load_proxies, fetch_with_proxies
 
-# ---------- Constants ----------
+# ---------- Константы ----------
 INPUT_HTML = "oils_catalog.txt"
 OUTPUT_DIR = "sitemaps_output"
 PROXY_FILE = "proxies_cleaned.txt"
@@ -20,7 +20,7 @@ PROXY_ALIVE_FILE = "proxies_alive.txt"
 BASE_URL = "https://zapo.ru"
 TARGET_URL = "https://zapo.ru/oils_catalog"
 MAX_URLS = 50000
-MAX_XML_SIZE = 10 * 1024 * 1024
+MAX_XML_SIZE = 8 * 1024 * 1024
 REQUEST_TIMEOUT = 15
 RETRIES = 10
 
@@ -28,13 +28,23 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ---------- Proxy setup ----------
-proxies = load_proxies(PROXY_FILE, PROXY_ALIVE_FILE)
+# ---------- Загрузка прокси ----------
+proxies = load_proxies(PROXY_FILE, PROXY_ALIVE_FILE, logger=print)
 working_proxies: list[str] = []
 
 
+def reload_proxies() -> list[str]:
+    """Перезагрузка прокси с проверкой живости."""
+    return load_proxies(
+        PROXY_FILE,
+        PROXY_ALIVE_FILE,
+        logger=print,
+        check_alive=True,
+    )
+
+
 def fetch_catalog_page() -> str:
-    """Return catalog HTML using utils.fetch_with_proxies."""
+    """Загрузить HTML-каталог с использованием прокси и перезагрузки."""
     html, _ = fetch_with_proxies(
         TARGET_URL,
         proxies,
@@ -43,16 +53,23 @@ def fetch_catalog_page() -> str:
         retries=RETRIES,
         timeout=REQUEST_TIMEOUT,
         logger=print,
+        reload_proxies=reload_proxies,
     )
     if not html or '<form' not in html:
-        raise RuntimeError('Failed to load catalog page')
+        raise RuntimeError('❌ Не удалось загрузить каталог масел')
     return html
 
 
 def load_or_fetch_html() -> str:
+    """Загрузить HTML из файла или с сайта, если файл отсутствует или повреждён."""
     if os.path.exists(INPUT_HTML):
         with open(INPUT_HTML, 'r', encoding='utf-8') as f:
-            return f.read()
+            html = f.read()
+            if '<form' in html:
+                return html
+            print("[HTML] ⚠️ Повреждённый кэш, пробуем заново...")
+            os.remove(INPUT_HTML)
+
     html = fetch_catalog_page()
     with open(INPUT_HTML, 'w', encoding='utf-8') as f:
         f.write(html)
@@ -60,10 +77,11 @@ def load_or_fetch_html() -> str:
 
 
 def parse_filters(html: str) -> dict[str, list[str]]:
+    """Распарсить доступные фильтры из формы каталога."""
     soup = BeautifulSoup(html, 'lxml')
     form = soup.find('form', id='catalog-form')
     if not form:
-        raise ValueError("<form id='catalog-form'> not found")
+        raise ValueError("<form id='catalog-form'> не найдена")
 
     checkboxes = form.find_all('input', {'type': 'checkbox', 'name': True})
     filters: defaultdict[str, list[str]] = defaultdict(list)
@@ -82,6 +100,7 @@ def parse_filters(html: str) -> dict[str, list[str]]:
 
 
 def generate_links(filters: dict[str, list[str]]) -> list[str]:
+    """Сгенерировать все возможные комбинации ссылок по фильтрам."""
     links = []
     for brand, viscosity, oil_type in product(
         filters.get('brands', []),
@@ -100,6 +119,7 @@ def generate_links(filters: dict[str, list[str]]) -> list[str]:
 
 
 def save_sitemaps(urls: list[str]) -> list[str]:
+    """Разбить ссылки на части и сохранить в .xml.gz файлы."""
     files: list[str] = []
     chunk: list[str] = []
     size_estimate = 0
@@ -139,6 +159,7 @@ def save_sitemaps(urls: list[str]) -> list[str]:
 
 
 def generate_index(gz_files: list[str]) -> None:
+    """Сгенерировать индексный файл sitemap_catalog_index.xml"""
     index_root = ET.Element('sitemapindex', xmlns='http://www.sitemaps.org/schemas/sitemap/0.9')
     now = datetime.now().isoformat(timespec='seconds') + '+03:00'
     for f in gz_files:
@@ -158,7 +179,9 @@ def main() -> None:
     filters = parse_filters(html)
     print('🧪 Найденные фильтры:')
     for key in ['brands', 'viscosity', 'oil_type']:
-        print(f"{key}: {len(filters.get(key, []))} значений")
+        values = filters.get(key, [])
+        preview = ", ".join(values[:5]) + ('...' if len(values) > 5 else '')
+        print(f"  {key}: {len(values)} значений → {preview}")
 
     urls = generate_links(filters)
     print(f'✅ Сгенерировано ссылок: {len(urls)}')
