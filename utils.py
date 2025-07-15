@@ -164,18 +164,20 @@ def fetch_with_proxies(
     reload_proxies: Callable[[], list[str]] | None = None,
 ) -> Tuple[str | None, str | None]:
     """
-    Загружает страницу с использованием списка прокси. При неудаче —
-    перезапрашивает прокси из reload_proxies и повторяет попытку.
+    Загружает страницу с использованием списка прокси. При удачном подключении
+    прокси добавляется в начало списка working для приоритетного использования.
+    При неудаче — прокси исключается из списка. Возможна повторная загрузка
+    списка через reload_proxies().
     """
     working = working or []
 
     for attempt in range(1, retries + 1):
         with proxy_lock:
-            proxy_list = proxies.copy()
-        random.shuffle(proxy_list)
+            proxy_list = working + [p for p in proxies if p not in working]
+            random.shuffle(proxy_list[len(working):])
 
         while proxy_list:
-            proxy = proxy_list.pop()
+            proxy = proxy_list.pop(0)
             try:
                 response = requests.get(
                     url,
@@ -185,8 +187,9 @@ def fetch_with_proxies(
                 )
                 response.raise_for_status()
                 with proxy_lock:
-                    if proxy not in working:
-                        working.append(proxy)
+                    if proxy in working:
+                        working.remove(proxy)
+                    working.insert(0, proxy)
                 return response.text, proxy
             except Exception as e:
                 if logger:
@@ -195,7 +198,6 @@ def fetch_with_proxies(
                     if proxy in proxies:
                         proxies.remove(proxy)
 
-        # 🔁 Прокси закончились — пробуем перезагрузить
         if reload_proxies and attempt < retries:
             if logger:
                 logger("[ПРОКСИ] 🔁 Все прокси исчерпаны. Пробуем загрузить новые...")
