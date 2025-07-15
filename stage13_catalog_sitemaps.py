@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import List, Dict, Any
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 
 from tqdm import tqdm
 from utils import load_proxies, fetch_with_proxies, MIRRORS, with_mirror
@@ -33,6 +34,8 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 DEFAULT_FILTER_LIMIT = 5
 THREADS = 1
+LINK_VALIDATION_THREADS = 30
+MAX_DEPTH = 5
 
 os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -71,6 +74,7 @@ def download_and_save_html(group_id: str) -> str:
 
     raise RuntimeError(f"❌ Пропуск {group_id}: Не удалось загрузить HTML")
 
+@lru_cache(maxsize=100_000)
 def is_valid_catalog_url_with_mirrors(url: str) -> bool:
     for mirror in MIRRORS:
         test_url = with_mirror(url, mirror)
@@ -90,6 +94,19 @@ def is_valid_catalog_url_with_mirrors(url: str) -> bool:
             continue
         return True
     return False
+
+def validate_links_parallel(urls: List[str], max_workers: int = LINK_VALIDATION_THREADS) -> List[str]:
+    valid = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(is_valid_catalog_url_with_mirrors, url): url for url in urls}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="🔍 Проверка ссылок"):
+            url = futures[future]
+            try:
+                if future.result():
+                    valid.append(url)
+            except Exception as e:
+                print(f"⚠️ Ошибка при проверке {url}: {e}")
+    return valid
 
 def parse_filters(html: str) -> Dict[str, List[str]]:
     soup = BeautifulSoup(html, "lxml")
@@ -129,7 +146,7 @@ def load_or_parse_filters(group_id: str) -> Dict[str, List[str]]:
 def generate_links_progressively(filters: Dict[str, List[str]], keys: List[str], group_id: str) -> List[str]:
     seen = set()
     links = []
-    for r in range(1, len(keys) + 1):
+    for r in range(1, min(len(keys), MAX_DEPTH) + 1):
         for key_combo in combinations(keys, r):
             values = [filters.get(k, []) for k in key_combo]
             for combo in product(*values):
@@ -183,7 +200,7 @@ def remove_old_sitemaps(group_id: str):
             except Exception as e:
                 print(f"⚠️ Не удалось удалить {f}: {e}")
 
-def process_group(group: Dict[str, Any], validate_links: bool = False, remove_old: bool = False) -> List[str]:
+def process_group(group: Dict[str, Any], validate_links: bool = True, remove_old: bool = False) -> List[str]:
     gid = group["id"]
     print(f"\n🚧 Обработка группы: {gid}")
 
@@ -207,20 +224,11 @@ def process_group(group: Dict[str, Any], validate_links: bool = False, remove_ol
         selected_keys = list(filters.keys())[:filter_limit]
         print(f"🔑 Выбраны фильтры: {selected_keys}")
 
-        for k in selected_keys:
-            print(f"🧩 {gid} — {k}: {len(filters[k])} значений")
-
         raw_urls = generate_links_progressively(filters, selected_keys, gid)
-        print(f"🧮 {gid} — всего сгенерировано ссылок: {len(raw_urls)}")
+        print(f"🔗 Сгенерировано {len(raw_urls)} ссылок")
 
-        valid_urls = []
-        if validate_links:
-            for url in tqdm(raw_urls, desc=f"[{gid}] Проверка ссылок"):
-                if is_valid_catalog_url_with_mirrors(url):
-                    valid_urls.append(url)
-            print(f"✅ Валидных ссылок: {len(valid_urls)} из {len(raw_urls)}")
-        else:
-            valid_urls = raw_urls
+        valid_urls = validate_links_parallel(raw_urls) if validate_links else raw_urls
+        print(f"✅ Валидных ссылок: {len(valid_urls)}")
 
         if not valid_urls:
             print(f"❌ Нет валидных ссылок для {gid}, пропуск...")
