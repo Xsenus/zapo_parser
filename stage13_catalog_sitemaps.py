@@ -188,19 +188,27 @@ def main():
 
     def process_group(group: Dict[str, Any]) -> List[str]:
         gid = group["id"]
+
         if gid not in all_filters:
             return []
+
         expected_file = os.path.join(OUTPUT_DIR, f"sitemap_{gid}_1.xml.gz")
         if os.path.exists(expected_file):
             print(f"⏭️ {gid} уже обработан, пропуск...")
             return []
+
         try:
             filters = all_filters[gid]
+
+            if not filters or all(len(v) == 0 for v in filters.values()):
+                raise ValueError(f"Пустые или некорректные фильтры для группы {gid}")
+
             filter_limit = group.get("filter_limit", DEFAULT_FILTER_LIMIT)
             selected_keys = list(filters.keys())[:filter_limit] if filter_limit else list(filters.keys())
             urls = generate_links(filters, selected_keys, gid)
             print(f"✅ {gid}: {len(urls)} ссылок по фильтрам {selected_keys}")
             return save_sitemaps(urls, gid)
+
         except Exception as e:
             print(f"❌ Ошибка в группе {gid}: {e}")
             return []
