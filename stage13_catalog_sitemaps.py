@@ -105,12 +105,23 @@ def load_or_parse_filters(group_id: str) -> Dict[str, List[str]]:
 # ---------- Генерация ссылок ----------
 def generate_links(filters: Dict[str, List[str]], keys: List[str], group_id: str) -> List[str]:
     values = [filters.get(k, []) for k in keys]
+
+    for k, v_list in zip(keys, values):
+        print(f"🧩 {group_id} — {k}: {len(v_list)} значений")
+
     links = []
+    total_combinations = 1
+    for v in values:
+        total_combinations *= len(v) if v else 0
+
+    print(f"🧮 {group_id} — всего комбинаций: {total_combinations}")
+
     for combo in product(*values):
         url = f"{BASE_URL}/{group_id}_catalog?goods_group={group_id}&action=search&viewMode=tile&resultMode=5&hidePriceIn=1"
         for k, v in zip(keys, combo):
             url += f"&property[{k}][]={quote(v)}"
         links.append(url)
+
     return links
 
 # ---------- Сохранение sitemap-файлов ----------
@@ -131,8 +142,11 @@ def save_sitemaps(urls: List[str], group_id: str) -> List[str]:
         with open(path, "rb") as f_in, gzip.open(gz_path, "wb") as f_out:
             f_out.writelines(f_in)
         os.remove(path)
+        print(f"📦 Сохранён: {gz_path} ({len(part_urls)} ссылок)")
         return gz_path
 
+    print(f"📄 Генерация sitemap для {group_id}: всего {len(urls)} ссылок")
+    
     for url in urls:
         size += len(url.encode()) + 100
         chunk.append(url)
@@ -143,6 +157,8 @@ def save_sitemaps(urls: List[str], group_id: str) -> List[str]:
 
     if chunk:
         files.append(write_chunk(chunk, index))
+
+    print(f"✅ Sitemap для {group_id} разбит на {len(files)} частей\n")
     return files
 
 # ---------- Индексный sitemap ----------
@@ -188,8 +204,10 @@ def main():
 
     def process_group(group: Dict[str, Any]) -> List[str]:
         gid = group["id"]
+        print(f"\n🚧 Обработка группы: {gid}")
 
         if gid not in all_filters:
+            print(f"⚠️ {gid} отсутствует в all_filters, пропуск...")
             return []
 
         expected_file = os.path.join(OUTPUT_DIR, f"sitemap_{gid}_1.xml.gz")
@@ -205,9 +223,15 @@ def main():
 
             filter_limit = group.get("filter_limit", DEFAULT_FILTER_LIMIT)
             selected_keys = list(filters.keys())[:filter_limit] if filter_limit else list(filters.keys())
+            print(f"🔑 Выбраны фильтры: {selected_keys}")
+
             urls = generate_links(filters, selected_keys, gid)
-            print(f"✅ {gid}: {len(urls)} ссылок по фильтрам {selected_keys}")
-            return save_sitemaps(urls, gid)
+            print(f"🔗 Сгенерировано {len(urls)} ссылок")
+
+            gz_files = save_sitemaps(urls, gid)
+            print(f"📤 Успешно сохранено {len(gz_files)} sitemap-файлов для {gid}")
+
+            return gz_files
 
         except Exception as e:
             print(f"❌ Ошибка в группе {gid}: {e}")
