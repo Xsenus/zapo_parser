@@ -6,7 +6,7 @@
 
 - `stage1_brands_scraper.py` — сбор информации о брендах и страницах  
 - `stage2_contacts_scraper.py` — поиск сайтов брендов  
-- `stage3_contacts_collector.py` — сбор email и телефонов с главной и контактных страниц  
+- `stage3_contacts_scraper.py` — сбор email и телефонов с главной и контактных страниц
 - `stage4_export_to_excel.py` — экспорт в Excel, деление на `.ru` и остальные домены  
 - `stage5_carbase_scraper.py` — парсинг автокаталога брендов, моделей и версий автомобилей  
 - `stage6_parse_modifications.py` — сбор модификаций автомобилей по version_url  
@@ -16,7 +16,7 @@
 - `stage10_parse_models.py` — парсинг моделей по брендам  
 - `stage11_parse_modification_table.py` — постраничный парсинг таблицы модификаций
 - `stage12_export_modifications_to_excel.py` — экспорт модификаций в Excel
-- `stage13_oils_sitemaps.py` — генерация sitemap для каталога масел
+- `stage13_catalog_sitemaps.py` — генерация sitemap каталога запчастей
 
 ## ⚙️ Установка
 
@@ -56,7 +56,7 @@ python stage8_export_parts_to_excel.py    # Детали
 - `stage5_carbase.json` — автокаталог с zapo.ru  
 - `stage6_versions_detailed.json`, `stage7_parts_detailed.json`, `stage11_modifications_detailed.json` — JSON с модификациями и деталями
 - `stage12_modifications_export.xlsx` — итоговая таблица модификаций
-- `sitemaps_output/sitemap_catalog_index.xml` — sitemap каталога масел
+- `sitemaps_output/sitemap_catalog_index.xml` — sitemap каталога запчастей
 
 ## 📌 Параметры экспорта
 
