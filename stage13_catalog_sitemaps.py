@@ -3,7 +3,7 @@ import re
 import json
 import gzip
 import xml.etree.ElementTree as ET
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from itertools import product, combinations
 from collections import defaultdict
 from datetime import datetime
@@ -36,6 +36,14 @@ DEFAULT_FILTER_LIMIT = 5
 THREADS = 1
 LINK_VALIDATION_THREADS = 30
 MAX_DEPTH = 5
+
+# ---------- Опциональные настройки ----------
+# Использовать API getFilters для подстановки значений
+USE_DYNAMIC_FILTERS = True
+# Если API недоступен, fallback на статические фильтры
+FALLBACK_TO_STATIC_FILTERS = True
+# Проверять сгенерированные ссылки на наличие товаров
+VALIDATE_LINKS = False
 
 os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -143,20 +151,125 @@ def load_or_parse_filters(group_id: str) -> Dict[str, List[str]]:
 
     raise RuntimeError(f"❌ Пропуск {group_id}: Не удалось получить фильтры")
 
-def generate_links_progressively(filters: Dict[str, List[str]], keys: List[str], group_id: str) -> List[str]:
+
+def generate_links_progressively(
+    filters: Dict[str, List[str]],
+    keys: List[str],
+    group_id: str,
+) -> List[str]:
+    """Сгенерировать ссылки, перебирая сохранённые значения фильтров."""
     seen = set()
-    links = []
+    links: List[str] = []
     for r in range(1, min(len(keys), MAX_DEPTH) + 1):
         for key_combo in combinations(keys, r):
             values = [filters.get(k, []) for k in key_combo]
             for combo in product(*values):
-                url = f"{BASE_URL}/{group_id}_catalog?goods_group={group_id}&action=search&viewMode=tile&resultMode=5&hidePriceIn=1"
+                url = (
+                    f"{BASE_URL}/{group_id}_catalog?goods_group={group_id}"
+                    f"&action=search&viewMode=tile&resultMode=5&hidePriceIn=1"
+                )
                 for k, v in zip(key_combo, combo):
                     url += f"&property[{k}][]={quote(v)}"
                 if url not in seen:
                     seen.add(url)
                     links.append(url)
     return links
+
+
+@lru_cache(maxsize=100_000)
+def _fetch_dynamic_filters_cached(
+    group_id: str,
+    selected_tuple: tuple,
+    exclude: str,
+) -> Dict[str, Any]:
+    params = {
+        "goods_group": group_id,
+        "action": "goods_catalog/goods_catalog/getFilters",
+        "viewMode": "tile",
+        "excluded": exclude,
+    }
+
+    for k, v in dict(selected_tuple).items():
+        params.setdefault(f"property[{k}][]", []).append(v)
+
+    url = f"{BASE_URL}/{group_id}_catalog?" + urlencode(params, doseq=True)
+
+    html, _ = fetch_with_proxies(
+        url,
+        proxies,
+        working_proxies,
+        headers=HEADERS,
+        retries=RETRIES,
+        timeout=REQUEST_TIMEOUT,
+        logger=print,
+        reload_proxies=reload_proxies,
+    )
+
+    if not html:
+        return {}
+
+    try:
+        return json.loads(html)
+    except Exception:
+        return {}
+
+
+def fetch_dynamic_filters(
+    group_id: str,
+    selected: Dict[str, str],
+    exclude: str,
+) -> Dict[str, Any]:
+    """Обёртка для кешированной функции."""
+    selected_tuple = tuple(sorted(selected.items()))
+    return _fetch_dynamic_filters_cached(group_id, selected_tuple, exclude)
+
+
+def generate_links_dynamic(
+    group_id: str,
+    keys: List[str],
+    max_depth: int = MAX_DEPTH,
+) -> List[str]:
+    """Рекурсивная генерация ссылок, используя API getFilters."""
+
+    links: List[str] = []
+
+    def build(selected: Dict[str, str], depth: int = 0):
+        if depth == len(keys) or depth >= max_depth:
+            if selected:
+                url = (
+                    f"{BASE_URL}/{group_id}_catalog?goods_group={group_id}"
+                    f"&action=search&viewMode=tile&resultMode=5&hidePriceIn=1"
+                )
+                for k, v in selected.items():
+                    url += f"&property[{k}][]={quote(v)}"
+                links.append(url)
+            return
+
+        key = keys[depth]
+        data = fetch_dynamic_filters(group_id, selected, key)
+        values = data.get(key, [])
+        for val in values:
+            selected[key] = val
+            build(selected, depth + 1)
+            del selected[key]
+
+    build({})
+    return links
+
+
+def generate_links(
+    group_id: str,
+    filters: Dict[str, List[str]],
+    keys: List[str],
+    max_depth: int = MAX_DEPTH,
+) -> List[str]:
+    """Выбрать способ генерации ссылок в зависимости от настроек."""
+    if USE_DYNAMIC_FILTERS:
+        urls = generate_links_dynamic(group_id, keys, max_depth)
+        if urls or not FALLBACK_TO_STATIC_FILTERS:
+            return urls
+    return generate_links_progressively(filters, keys, group_id)
+
 
 def save_sitemaps(urls: List[str], group_id: str) -> List[str]:
     now = datetime.now().isoformat(timespec="seconds") + "+03:00"
@@ -200,7 +313,11 @@ def remove_old_sitemaps(group_id: str):
             except Exception as e:
                 print(f"⚠️ Не удалось удалить {f}: {e}")
 
-def process_group(group: Dict[str, Any], validate_links: bool = True, remove_old: bool = False) -> List[str]:
+def process_group(
+    group: Dict[str, Any],
+    validate_links: bool = VALIDATE_LINKS,
+    remove_old: bool = False,
+) -> List[str]:
     gid = group["id"]
     print(f"\n🚧 Обработка группы: {gid}")
 
@@ -224,7 +341,7 @@ def process_group(group: Dict[str, Any], validate_links: bool = True, remove_old
         selected_keys = list(filters.keys())[:filter_limit]
         print(f"🔑 Выбраны фильтры: {selected_keys}")
 
-        raw_urls = generate_links_progressively(filters, selected_keys, gid)
+        raw_urls = generate_links(gid, filters, selected_keys)
         print(f"🔗 Сгенерировано {len(raw_urls)} ссылок")
 
         valid_urls = validate_links_parallel(raw_urls) if validate_links else raw_urls
@@ -294,7 +411,7 @@ def main():
 
     with ThreadPoolExecutor(max_workers=THREADS) as executor:
         futures = {
-            executor.submit(process_group, g, validate_links=False, remove_old=False): g["id"]
+            executor.submit(process_group, g, validate_links=VALIDATE_LINKS, remove_old=False): g["id"]
             for g in groups
         }
         for future in as_completed(futures):
