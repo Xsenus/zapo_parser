@@ -7,7 +7,7 @@ from time import time
 INPUT_DIR = "stage13_temp_results/sitemaps_output"
 OUTPUT_DIR = "stage13_temp_results/catalog_combined"
 MAX_URLS = 50000
-MAX_FILESIZE = 8 * 1024 * 1024
+MAX_FILESIZE = 10 * 1024 * 1024
 CHECK_EVERY = 100  
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -20,9 +20,16 @@ def get_xml_size(urls):
     return len(ET.tostring(root, encoding="utf-8", xml_declaration=True))
 
 def save_batch(batch, part):
-    root = ET.Element("urlset", xmlns="http://www.sitemaps.org/schemas/sitemap/0.9")
-    for e in batch:
-        root.append(e)
+    ns = "http://www.sitemaps.org/schemas/sitemap/0.9"
+    root = ET.Element("urlset", xmlns=ns)
+
+    for old in batch:
+        url_el = ET.SubElement(root, "url")
+        for tag in ["loc", "lastmod", "changefreq"]:
+            val = old.findtext(f"{{{ns}}}{tag}")
+            if val:
+                ET.SubElement(url_el, tag).text = val
+
     tree = ET.ElementTree(root)
     filename = os.path.join(OUTPUT_DIR, f"sitemap_catalog_{part}.xml")
     tree.write(filename, encoding="utf-8", xml_declaration=True, pretty_print=True)
