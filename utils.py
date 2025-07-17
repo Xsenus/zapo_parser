@@ -164,20 +164,25 @@ def fetch_with_proxies(
     reload_proxies: Callable[[], list[str]] | None = None,
 ) -> Tuple[str | None, str | None]:
     """
-    Загружает страницу с использованием списка прокси. При удачном подключении
-    прокси добавляется в начало списка working для приоритетного использования.
-    При неудаче — прокси исключается из списка. Возможна повторная загрузка
-    списка через reload_proxies().
+    Загружает страницу с использованием списка прокси. Без приоритета working-прокси.
+    Работает как старая версия, но с защитой от антибота.
     """
+    def is_blocked(html: str) -> bool:
+        return (
+            "Robot Geo Check Redirector" in html
+            or "window.location.href" in html
+            or "enable Javascript" in html
+        )
+
     working = working or []
 
     for attempt in range(1, retries + 1):
         with proxy_lock:
-            proxy_list = working + [p for p in proxies if p not in working]
-            random.shuffle(proxy_list[len(working):])
+            proxy_list = proxies.copy()
+        random.shuffle(proxy_list)
 
         while proxy_list:
-            proxy = proxy_list.pop(0)
+            proxy = proxy_list.pop()
             try:
                 response = requests.get(
                     url,
@@ -186,10 +191,11 @@ def fetch_with_proxies(
                     proxies=get_proxy_dict(proxy),
                 )
                 response.raise_for_status()
+                if is_blocked(response.text):
+                    raise RuntimeError("❌ Заблокировано антибот-защитой")
                 with proxy_lock:
-                    if proxy in working:
-                        working.remove(proxy)
-                    working.insert(0, proxy)
+                    if proxy not in working:
+                        working.append(proxy)
                 return response.text, proxy
             except Exception as e:
                 if logger:
@@ -198,6 +204,7 @@ def fetch_with_proxies(
                     if proxy in proxies:
                         proxies.remove(proxy)
 
+        # 🔁 Прокси закончились — пробуем перезагрузить
         if reload_proxies and attempt < retries:
             if logger:
                 logger("[ПРОКСИ] 🔁 Все прокси исчерпаны. Пробуем загрузить новые...")
@@ -220,6 +227,8 @@ def fetch_with_proxies(
                 logger(f"[ПОПЫТКА {attempt}] Пробуем загрузить без прокси...")
             response = requests.get(url, headers=headers, timeout=timeout)
             response.raise_for_status()
+            if is_blocked(response.text):
+                raise RuntimeError("❌ Доступ без прокси заблокирован")
             return response.text, None
         except Exception as e:
             if logger:
