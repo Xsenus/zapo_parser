@@ -2,7 +2,8 @@ import os
 import re
 import json
 import gzip
-import xml.etree.ElementTree as ET
+from lxml import etree as ET
+import time
 from urllib.parse import quote, urlencode
 from itertools import product, combinations
 from collections import defaultdict
@@ -11,11 +12,9 @@ from typing import List, Dict, Any
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
-
 from tqdm import tqdm
 from utils import load_proxies, fetch_with_proxies, MIRRORS, with_mirror
 
-# ---------- Константы ----------
 GROUPS_FILE = "groups.json"
 TEMP_DIR = "stage13_temp_results"
 FILTERS_DIR = os.path.join(TEMP_DIR, "filters_json")
@@ -23,26 +22,23 @@ OUTPUT_DIR = os.path.join(TEMP_DIR, "sitemaps_output")
 ALL_FILTERS_JSON = os.path.join(TEMP_DIR, "all_filters.json")
 DONE_GROUPS_FILE = os.path.join(TEMP_DIR, "done_groups.json")
 
+THREADS = 4
+LINK_VALIDATION_THREADS = 50
+
+DEFAULT_FILTER_LIMIT = 7
+MAX_DEPTH = 10
+MAX_DYNAMIC_LINKS = 2_000_000
+
 PROXY_FILE = "proxies_cleaned.txt"
 PROXY_ALIVE_FILE = "proxies_alive.txt"
 BASE_URL = "https://zapo.ru"
-MAX_URLS = 50000
+MAX_URLS = 50_000
 MAX_XML_SIZE = 8 * 1024 * 1024
-REQUEST_TIMEOUT = 15
+REQUEST_TIMEOUT = 10
 RETRIES = 25
 HEADERS = {"User-Agent": "Mozilla/5.0"}
-
-DEFAULT_FILTER_LIMIT = 5
-THREADS = 1
-LINK_VALIDATION_THREADS = 30
-MAX_DEPTH = 5
-
-# ---------- Опциональные настройки ----------
-# Использовать API getFilters для подстановки значений
 USE_DYNAMIC_FILTERS = True
-# Если API недоступен, fallback на статические фильтры
 FALLBACK_TO_STATIC_FILTERS = True
-# Проверять сгенерированные ссылки на наличие товаров
 VALIDATE_LINKS = False
 
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -68,21 +64,25 @@ def download_and_save_html(group_id: str) -> str:
             os.remove(html_path)
 
         print(f"[{group_id}] Попытка загрузки #{attempt}")
-        html, _ = fetch_with_proxies(
-            url, proxies, working_proxies,
-            headers=HEADERS, retries=RETRIES,
-            timeout=REQUEST_TIMEOUT,
-            logger=print,
-            reload_proxies=reload_proxies,
-        )
-        if html and "<form" in html:
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(html)
-            return html
 
-    raise RuntimeError(f"❌ Пропуск {group_id}: Не удалось загрузить HTML")
+        try:
+            html, _ = fetch_with_proxies(
+                url, proxies, working_proxies,
+                headers=HEADERS,
+                retries=1,
+                timeout=REQUEST_TIMEOUT,
+                logger=print,
+                reload_proxies=reload_proxies,
+            )
+            if html and "<form" in html:
+                with open(html_path, "w", encoding="utf-8") as f:
+                    f.write(html)
+                return html
+        except Exception as e:
+            print(f"[{group_id}] ❌ Ошибка загрузки: {e}")
 
-@lru_cache(maxsize=100_000)
+    raise RuntimeError(f"❌ Пропуск {group_id}: Не удалось загрузить HTML после {RETRIES} попыток")
+
 def is_valid_catalog_url_with_mirrors(url: str) -> bool:
     for mirror in MIRRORS:
         test_url = with_mirror(url, mirror)
@@ -104,6 +104,8 @@ def is_valid_catalog_url_with_mirrors(url: str) -> bool:
     return False
 
 def validate_links_parallel(urls: List[str], max_workers: int = LINK_VALIDATION_THREADS) -> List[str]:
+    if not urls:
+        return []    
     valid = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(is_valid_catalog_url_with_mirrors, url): url for url in urls}
@@ -175,13 +177,14 @@ def generate_links_progressively(
                     links.append(url)
     return links
 
-
 @lru_cache(maxsize=100_000)
 def _fetch_dynamic_filters_cached(
     group_id: str,
     selected_tuple: tuple,
     exclude: str,
 ) -> Dict[str, Any]:
+    from urllib.parse import urlencode
+
     params = {
         "goods_group": group_id,
         "action": "goods_catalog/goods_catalog/getFilters",
@@ -192,13 +195,22 @@ def _fetch_dynamic_filters_cached(
     for k, v in dict(selected_tuple).items():
         params.setdefault(f"property[{k}][]", []).append(v)
 
-    url = f"{BASE_URL}/{group_id}_catalog?" + urlencode(params, doseq=True)
+    # 👉 Сформировать полный URL с query-параметрами
+    base_url = f"{BASE_URL}/{group_id}_catalog"
+    full_url = f"{base_url}?{urlencode(params, doseq=True)}"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": base_url,
+    }
 
     html, _ = fetch_with_proxies(
-        url,
+        full_url,
         proxies,
         working_proxies,
-        headers=HEADERS,
+        headers=headers,
         retries=RETRIES,
         timeout=REQUEST_TIMEOUT,
         logger=print,
@@ -206,13 +218,15 @@ def _fetch_dynamic_filters_cached(
     )
 
     if not html:
+        print(f"⚠️ Пустой ответ на fetchFilters для {group_id} с {selected_tuple=}, {exclude=}")
         return {}
 
     try:
         return json.loads(html)
-    except Exception:
+    except Exception as e:
+        print(f"❌ Ошибка парсинга JSON для {group_id}: {e}")
+        print(f"↩️ Ответ: {html[:200]}...")
         return {}
-
 
 def fetch_dynamic_filters(
     group_id: str,
@@ -229,33 +243,56 @@ def generate_links_dynamic(
     keys: List[str],
     max_depth: int = MAX_DEPTH,
 ) -> List[str]:
-    """Рекурсивная генерация ссылок, используя API getFilters."""
+    """Рекурсивная генерация ссылок, используя API getFilters с контролем глубины и количества."""
 
     links: List[str] = []
+    seen: set[str] = set()
 
     def build(selected: Dict[str, str], depth: int = 0):
-        if depth == len(keys) or depth >= max_depth:
-            if selected:
-                url = (
-                    f"{BASE_URL}/{group_id}_catalog?goods_group={group_id}"
-                    f"&action=search&viewMode=tile&resultMode=5&hidePriceIn=1"
-                )
-                for k, v in selected.items():
-                    url += f"&property[{k}][]={quote(v)}"
+        nonlocal links
+
+        if selected:
+            url = (
+                f"{BASE_URL}/{group_id}_catalog?goods_group={group_id}"
+                f"&action=search&viewMode=tile&resultMode=5&hidePriceIn=1"
+            )
+            for k, v in selected.items():
+                url += f"&property[{k}][]={quote(v)}"
+
+            if url not in seen:
+                seen.add(url)
                 links.append(url)
+                if len(links) % 1000 == 0:
+                    print(f"🔗 [{group_id}] Сгенерировано {len(links)} ссылок...")
+
+            if len(links) >= MAX_DYNAMIC_LINKS:
+                return
+
+        if depth >= len(keys) or depth >= max_depth:
             return
 
         key = keys[depth]
+        
+        start = time.time()
         data = fetch_dynamic_filters(group_id, selected, key)
+        elapsed = time.time() - start
+        if elapsed > 5:
+            print(f"🐢 [{group_id}] {key} — запрос длился {elapsed:.1f} сек.")
+            
         values = data.get(key, [])
+
+        if not values:
+            return
+
         for val in values:
             selected[key] = val
             build(selected, depth + 1)
             del selected[key]
 
+            if len(links) >= MAX_DYNAMIC_LINKS:
+                return
     build({})
     return links
-
 
 def generate_links(
     group_id: str,
@@ -270,39 +307,45 @@ def generate_links(
             return urls
     return generate_links_progressively(filters, keys, group_id)
 
-
 def save_sitemaps(urls: List[str], group_id: str) -> List[str]:
     now = datetime.now().isoformat(timespec="seconds") + "+03:00"
-    files, chunk, size, index = [], [], 0, 1
+    xml_paths, chunk, size, index = [], [], 0, 1
 
-    def write_chunk(part_urls: List[str], part_index: int) -> str:
-        urlset = ET.Element("urlset", xmlns="http://www.sitemaps.org/schemas/sitemap/0.9")
+    def write_xml_chunk(part_urls: List[str], part_index: int) -> str:
+        urlset = ET.Element("urlset", nsmap={None: "http://www.sitemaps.org/schemas/sitemap/0.9"})
         for u in part_urls:
             url_el = ET.SubElement(urlset, "url")
             ET.SubElement(url_el, "loc").text = u
             ET.SubElement(url_el, "lastmod").text = now
             ET.SubElement(url_el, "changefreq").text = "weekly"
         path = os.path.join(OUTPUT_DIR, f"sitemap_{group_id}_{part_index}.xml")
-        ET.ElementTree(urlset).write(path, encoding="utf-8", xml_declaration=True)
+        tree = ET.ElementTree(urlset)
+        tree.write(path, encoding="utf-8", pretty_print=False, xml_declaration=True)
+        return path
+
+    def gzip_file(path: str) -> str:
         gz_path = path + ".gz"
         with open(path, "rb") as f_in, gzip.open(gz_path, "wb") as f_out:
             f_out.writelines(f_in)
         os.remove(path)
-        print(f"📦 Сохранён: {gz_path} ({len(part_urls)} ссылок)")
+        print(f"📦 Архивирован: {gz_path}")
         return gz_path
 
     for url in urls:
         size += len(url.encode()) + 100
         chunk.append(url)
         if len(chunk) >= MAX_URLS or size >= MAX_XML_SIZE:
-            files.append(write_chunk(chunk, index))
+            xml_paths.append(write_xml_chunk(chunk, index))
             chunk, size = [], 0
             index += 1
 
     if chunk:
-        files.append(write_chunk(chunk, index))
+        xml_paths.append(write_xml_chunk(chunk, index))
 
-    return files
+    with ThreadPoolExecutor(max_workers=THREADS) as executor:
+        gz_files = list(executor.map(gzip_file, xml_paths))
+
+    return gz_files
 
 def remove_old_sitemaps(group_id: str):
     for f in os.listdir(OUTPUT_DIR):
@@ -342,7 +385,14 @@ def process_group(
         print(f"🔑 Выбраны фильтры: {selected_keys}")
 
         raw_urls = generate_links(gid, filters, selected_keys)
+        if len(raw_urls) >= MAX_DYNAMIC_LINKS:
+            print(f"⚠️ Превышен лимит ссылок ({MAX_DYNAMIC_LINKS}), остановка.")
+            
         print(f"🔗 Сгенерировано {len(raw_urls)} ссылок")
+        
+        if not raw_urls:
+            print(f"⚠️ {gid} — Нет сгенерированных ссылок, пропуск...")
+            return []
 
         valid_urls = validate_links_parallel(raw_urls) if validate_links else raw_urls
         print(f"✅ Валидных ссылок: {len(valid_urls)}")
@@ -355,8 +405,9 @@ def process_group(
         print(f"📤 Успешно сохранено {len(gz_files)} sitemap-файлов для {gid}")
 
         done_groups.add(gid)
-        with open(DONE_GROUPS_FILE, "w", encoding="utf-8") as f:
+        with open(DONE_GROUPS_FILE + ".tmp", "w", encoding="utf-8") as f:
             json.dump(sorted(done_groups), f, indent=2, ensure_ascii=False)
+        os.replace(DONE_GROUPS_FILE + ".tmp", DONE_GROUPS_FILE)
 
         return gz_files
 
@@ -378,9 +429,13 @@ def generate_index(gz_files: List[str]):
     )
 
 def main():
-    global all_filters, done_groups
+    global all_filters, done_groups    
+    
     with open(GROUPS_FILE, "r", encoding="utf-8") as f:
         groups = json.load(f)
+
+    if os.getenv("TEST_GROUP"):
+        groups = [g for g in groups if g["id"] == os.getenv("TEST_GROUP")]
 
     all_filters = {}
     all_gz = []
